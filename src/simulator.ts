@@ -363,7 +363,7 @@ export class TrafficSimulator {
                 if (!candidateId || candidateId === startId) continue;
                 const cand = g.edges.get(candidateId);
                 if (!cand || cand.segmentId === startEdge.segmentId) continue;
-                if (g.destEdgeIds.length > 6 && edgeDistanceMeters(startEdge, cand) < 80) {
+                if (dTry < 4 && g.destEdgeIds.length > 6 && edgeDistanceMeters(startEdge, cand) < 80) {
                     continue;
                 }
                 const spawned = this.spawnSpecificWazer(startId, candidateId);
@@ -603,8 +603,15 @@ export class TrafficSimulator {
 
                     if (nextEdge && !nextEdge.isClosed) {
                         const nextOcc = this.edgeOccupancy.get(nextEdge.id) ?? 0;
+                        const toNodeObj =
+                            edge.toNodeId != null ? g.nodes.get(edge.toNodeId) : undefined;
+                        const isMergeJunction = Boolean(
+                            toNodeObj && toNodeObj.connectedSegmentIds.length > 2
+                        );
                         const nodeBlocked =
-                            edge.toNodeId != null && (this.nodeCooldowns.get(edge.toNodeId) ?? 0) > 0;
+                            isMergeJunction &&
+                            edge.toNodeId != null &&
+                            (this.nodeCooldowns.get(edge.toNodeId) ?? 0) > 0;
 
                         if (nextOcc < nextEdge.maxCapacity && !nodeBlocked) {
                             const nextList = byEdge.get(nextEdge.id);
@@ -674,14 +681,24 @@ export class TrafficSimulator {
 
                         if (edge.toNodeId != null) {
                             const nodeObj = g.nodes.get(edge.toNodeId);
-                            const cap = nodeObj ? nodeObj.lanesCapacity : 2;
-                            this.nodeCooldowns.set(edge.toNodeId, 1 / Math.max(1.2, cap * 0.9));
+                            if (nodeObj && nodeObj.connectedSegmentIds.length > 2) {
+                                this.nodeCooldowns.set(
+                                    edge.toNodeId,
+                                    1 / Math.max(1.2, nodeObj.lanesCapacity * 0.9)
+                                );
+                            }
                         }
 
                         // Skip updating laneLeader on old edge since Wazer left it
                         this.updateChaosState(w, nextEdge!, dt, clampedRawDt);
                         continue;
                     }
+                }
+
+                if (desiredSpeed === 0) {
+                    w.openRoadSeconds = 0;
+                } else if (desiredSpeed < openRoadTarget * 0.85) {
+                    w.openRoadSeconds = Math.max(0, w.openRoadSeconds - dt * 3.5);
                 }
 
                 // Integrate speed and distance with realistic acceleration and braking

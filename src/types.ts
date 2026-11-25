@@ -16,7 +16,7 @@ export const DEFAULT_SIM_SETTINGS: SimSettings = {
     enabled: true,
     paused: false,
     soundEnabled: false,
-    maxWazers: 60,
+    maxWazers: 42,
     simSpeed: 1.5,
     patienceSeconds: 10,
     showHeatmap: true,

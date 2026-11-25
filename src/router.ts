@@ -1,5 +1,6 @@
 import { distanceMeters } from "./geo";
 import { edgeEndCoord, edgeStartCoord } from "./graph";
+import { getRoadProfile } from "./roadProfiles";
 import { DiagnosticTransition, DirectedEdge, RoadGraph, TerminalBug } from "./types";
 
 export interface RouteResult {
@@ -83,7 +84,13 @@ function edgeTravelCost(edge: DirectedEdge, occupancy: Map<string, number>): num
     const occ = occupancy.get(edge.id) ?? 0;
     const ratio = edge.maxCapacity > 0 ? Math.min(2, occ / edge.maxCapacity) : 0;
     const congestionMultiplier = 1 + 2.5 * ratio * ratio;
-    return (edge.lengthMeters / Math.max(edge.speedMps, 2)) * congestionMultiplier;
+    const effectiveRoadType = edge.routingRoadType ?? edge.roadType;
+    const importanceFactor = getRoadProfile(effectiveRoadType).routingFactor;
+    return (
+        (edge.lengthMeters / Math.max(edge.speedMps, 2)) *
+        importanceFactor *
+        congestionMultiplier
+    );
 }
 
 function reconstructPath(

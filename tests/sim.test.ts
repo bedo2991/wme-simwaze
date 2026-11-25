@@ -207,10 +207,17 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
     assertOk(fwy.lanes > st.lanes, "Freeway has more lanes than Street");
     assertOk(fwy.maxCapacity > st.maxCapacity, "Freeway supports more Wazers than Street");
     assertOk(fwy.spawnWeight > st.spawnWeight, "Freeway has higher spawnWeight than Street");
-    assertEqual(alley.spawnWeight, 0, "Alley does not spawn highway traffic");
+    assertOk(st.spawnWeight > graph.edges.get("3:R")!.spawnWeight, "Street has higher spawnWeight than Alley");
+    assertEqual(alley.spawnWeight, 0, "Dead-end alley tip does not spawn into cul-de-sac wall");
     assertOk(alley.destWeight > fwy.destWeight, "Alley has higher destination weight than Freeway");
-    assertDeepEqual(graph.spawnEdgeIds, ["1:F"], "Only highway edges are primary spawners when present");
-    console.log("PASS: Test 1 — Road capacities & highway spawning");
+    assertOk(graph.spawnEdgeIds.includes("1:F"), "Freeway included in spawnEdgeIds");
+    assertOk(
+        graph.spawnEdgeIds.includes("2:F") &&
+            graph.spawnEdgeIds.includes("2:R") &&
+            graph.spawnEdgeIds.includes("3:R"),
+        "Connected local streets and outward alley included in spawnEdgeIds alongside highways"
+    );
+    console.log("PASS: Test 1 — Road capacities & weighted all-road spawning");
 }
 
 // 2. Speed limits & imperial conversion
@@ -1049,7 +1056,15 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         );
     }
 
-    const sim = new TrafficSimulator({ ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 16 });
+    let seed11 = 123456789;
+    const rng11 = () => {
+        seed11 = (Math.imul(seed11, 1664525) + 1013904223) >>> 0;
+        return seed11 / 0x100000000;
+    };
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 16 },
+        { rng: rng11 }
+    );
     sim.setGraph(graph);
 
     let sawEastbound = false;
@@ -1229,6 +1244,233 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         .filter((h) => h.kind === "DISCONNECTED_NODE" || h.kind === "DEAD_END");
     assertEqual(badHotspots.length, 0, "Zero DISCONNECTED_NODE or DEAD_END hotspots on healthy dead ends");
     console.log("PASS: Test 12 — Dead-end roads end routes cleanly without DISCONNECTED_NODE false positives");
+}
+
+// 13. Street-only maps spawn & flow (ignoring off-screen highways), and routes prioritize road importance
+{
+    // Part A: Street-only viewport with an off-screen cached Freeway 3km away
+    const streetOnlyRaw = baseRaw({
+        viewportBBox: [12.0, 45.0, 12.004, 45.003],
+        segments: [
+            makeSegment(1, [[12.0, 45.001], [12.002, 45.001]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 1,
+                toNodeId: 2,
+                length: 155,
+            }),
+            makeSegment(2, [[12.002, 45.001], [12.004, 45.001]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                length: 155,
+            }),
+            makeSegment(3, [[12.002, 45.0], [12.002, 45.001]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 4,
+                toNodeId: 2,
+                length: 110,
+            }),
+            makeSegment(4, [[12.002, 45.001], [12.002, 45.003]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 2,
+                toNodeId: 5,
+                length: 220,
+            }),
+            // Off-screen cached Freeway far outside viewportBBox
+            makeSegment(90, [[12.04, 45.04], [12.05, 45.04]], {
+                roadType: ROAD_TYPE.FREEWAY,
+                fromNodeId: 900,
+                toNodeId: 901,
+                isTwoWay: false,
+                isAtoB: true,
+                length: 800,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 12.0, 45.001, [1]),
+            makeNode(2, 12.002, 45.001, [1, 2, 3, 4]),
+            makeNode(3, 12.004, 45.001, [2]),
+            makeNode(4, 12.002, 45.0, [3]),
+            makeNode(5, 12.002, 45.003, [4]),
+            makeNode(900, 12.04, 45.04, [90]),
+            makeNode(901, 12.05, 45.04, [90]),
+        ],
+        streets: [
+            makeStreet(1, "Maple St"),
+            makeStreet(2, "Maple St"),
+            makeStreet(3, "Oak St"),
+            makeStreet(4, "Oak St"),
+            makeStreet(90, "Far Freeway"),
+        ],
+    });
+
+    const streetGraph = buildRoadGraphFromRawData(streetOnlyRaw);
+    assertOk(
+        streetGraph.spawnEdgeIds.includes("1:F") &&
+            streetGraph.spawnEdgeIds.includes("3:F") &&
+            !streetGraph.spawnEdgeIds.includes("90:F"),
+        "Street-only viewport spawns on visible streets and ignores off-screen cached freeway"
+    );
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 10 },
+        { rng: () => 0.3 }
+    );
+    sim.setGraph(streetGraph);
+    for (let i = 0; i < 200; i++) {
+        sim.step(0.1);
+    }
+    assertOk(sim.getStats().activeWazers > 0, "Street-only viewport actively spawns Wazers");
+    assertOk(sim.getStats().arrivedCount >= 1, "Street-only Wazers complete trips and arrive");
+
+    // Part B: Strict road importance hierarchy with equal lengths & equal 50 km/h speed limits
+    const hierarchy = [
+        ROAD_TYPE.FREEWAY,
+        ROAD_TYPE.MAJOR_HIGHWAY,
+        ROAD_TYPE.MINOR_HIGHWAY,
+        ROAD_TYPE.PRIMARY_STREET,
+        ROAD_TYPE.STREET,
+        ROAD_TYPE.ALLEY,
+        ROAD_TYPE.PRIVATE_ROAD,
+        ROAD_TYPE.PARKING_LOT_ROAD,
+    ] as const;
+
+    for (let idx = 0; idx < hierarchy.length - 1; idx++) {
+        const highType = hierarchy[idx];
+        const lowType = hierarchy[idx + 1];
+        const cmpRaw = baseRaw({
+            segments: [
+                makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                    fwdSpeedLimit: 50,
+                    length: 80,
+                }),
+                // Upper branch: higher-importance road
+                makeSegment(2, [[12.001, 45.0], [12.002, 45.001]], {
+                    roadType: highType,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    fwdSpeedLimit: 50,
+                    revSpeedLimit: 50,
+                    length: 135,
+                }),
+                makeSegment(3, [[12.002, 45.001], [12.003, 45.0]], {
+                    roadType: highType,
+                    fromNodeId: 3,
+                    toNodeId: 5,
+                    fwdSpeedLimit: 50,
+                    revSpeedLimit: 50,
+                    length: 135,
+                }),
+                // Lower branch: lower-importance road (same length & speed)
+                makeSegment(4, [[12.001, 45.0], [12.002, 44.999]], {
+                    roadType: lowType,
+                    fromNodeId: 2,
+                    toNodeId: 4,
+                    fwdSpeedLimit: 50,
+                    revSpeedLimit: 50,
+                    length: 135,
+                }),
+                makeSegment(5, [[12.002, 44.999], [12.003, 45.0]], {
+                    roadType: lowType,
+                    fromNodeId: 4,
+                    toNodeId: 5,
+                    fwdSpeedLimit: 50,
+                    revSpeedLimit: 50,
+                    length: 135,
+                }),
+                makeSegment(6, [[12.003, 45.0], [12.004, 45.0]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 5,
+                    toNodeId: 6,
+                    fwdSpeedLimit: 50,
+                    length: 80,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0, 45.0, [1]),
+                makeNode(2, 12.001, 45.0, [1, 2, 4]),
+                makeNode(3, 12.002, 45.001, [2, 3]),
+                makeNode(4, 12.002, 44.999, [4, 5]),
+                makeNode(5, 12.003, 45.0, [3, 5, 6]),
+                makeNode(6, 12.004, 45.0, [6]),
+            ],
+            streets: [makeStreet(1, "Start Rd"), makeStreet(6, "End Rd")],
+        });
+
+        const cmpGraph = buildRoadGraphFromRawData(cmpRaw);
+        const cmpRoute = findRoute(cmpGraph, "1:F", "6:F", new Map());
+        assertOk(cmpRoute, `Route found comparing roadType ${highType} vs ${lowType}`);
+        assertDeepEqual(
+            cmpRoute.routeEdgeIds,
+            ["1:F", "2:F", "3:F", "6:F"],
+            `Router prioritizes roadType ${highType} over ${lowType}`
+        );
+    }
+
+    // Verify routingRoadType override is also respected
+    const overrideRaw = baseRaw({
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 1,
+                toNodeId: 2,
+                fwdSpeedLimit: 50,
+            }),
+            makeSegment(2, [[12.001, 45.0], [12.002, 45.001]], {
+                roadType: ROAD_TYPE.STREET,
+                routingRoadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                fwdSpeedLimit: 50,
+            }),
+            makeSegment(3, [[12.002, 45.001], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                routingRoadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 3,
+                toNodeId: 5,
+                fwdSpeedLimit: 50,
+            }),
+            makeSegment(4, [[12.001, 45.0], [12.002, 44.999]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 2,
+                toNodeId: 4,
+                fwdSpeedLimit: 50,
+            }),
+            makeSegment(5, [[12.002, 44.999], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 4,
+                toNodeId: 5,
+                fwdSpeedLimit: 50,
+            }),
+            makeSegment(6, [[12.003, 45.0], [12.004, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 5,
+                toNodeId: 6,
+                fwdSpeedLimit: 50,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 12.0, 45.0, [1]),
+            makeNode(2, 12.001, 45.0, [1, 2, 4]),
+            makeNode(3, 12.002, 45.001, [2, 3]),
+            makeNode(4, 12.002, 44.999, [4, 5]),
+            makeNode(5, 12.003, 45.0, [3, 5, 6]),
+            makeNode(6, 12.004, 45.0, [6]),
+        ],
+        streets: [makeStreet(1, "Entry"), makeStreet(6, "Exit")],
+    });
+    const overrideRoute = findRoute(buildRoadGraphFromRawData(overrideRaw), "1:F", "6:F", new Map());
+    assertOk(overrideRoute, "Route found with routingRoadType override");
+    assertDeepEqual(
+        overrideRoute.routeEdgeIds,
+        ["1:F", "2:F", "3:F", "6:F"],
+        "Router respects routingRoadType priority override"
+    );
+
+    console.log("PASS: Test 13 — Street-only spawning & road importance routing priority");
 }
 
 console.log("ALL SIMWAZE TESTS PASSED");

@@ -509,6 +509,71 @@ export async function buildRoadGraphFromSDK(wmeSDK: AsyncWmeSDK): Promise<RoadGr
     return buildRoadGraphFromRawData(raw);
 }
 
+function segmentIntersectsBox(
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number,
+    minX: number,
+    minY: number,
+    maxX: number,
+    maxY: number
+): boolean {
+    const dx = bx - ax;
+    const dy = by - ay;
+    let t0 = 0;
+    let t1 = 1;
+    const checks: Array<[number, number]> = [
+        [-dx, ax - minX],
+        [dx, maxX - ax],
+        [-dy, ay - minY],
+        [dy, maxY - ay],
+    ];
+    for (const [p, q] of checks) {
+        if (Math.abs(p) < 1e-12) {
+            if (q < 0) return false;
+        } else {
+            const r = q / p;
+            if (p < 0) {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            } else {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+        }
+    }
+    return t0 <= t1;
+}
+
+function edgeIntersectsExpandedViewport(
+    edge: DirectedEdge,
+    bbox: [number, number, number, number]
+): boolean {
+    const [west, south, east, north] = bbox;
+    const padLon = Math.max(0.0025, (east - west) * 0.25);
+    const padLat = Math.max(0.0025, (north - south) * 0.25);
+    const minX = west - padLon;
+    const minY = south - padLat;
+    const maxX = east + padLon;
+    const maxY = north + padLat;
+
+    const coords = edge.coords;
+    for (let i = 0; i < coords.length; i++) {
+        const [x, y] = coords[i];
+        if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+            return true;
+        }
+        if (i > 0) {
+            const [px, py] = coords[i - 1];
+            if (segmentIntersectsBox(px, py, x, y, minX, minY, maxX, maxY)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 function buildCumulativeWeights(
     edgeIds: string[],
     edges: Map<string, DirectedEdge>,
@@ -741,8 +806,11 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
                 isRoundaboutRing || isShortRoundaboutFlare || isDirectionless
                     ? 0
                     : profile.spawnWeight;
-            if (spawnWeight > 0 && profile.isHighwaySpawn && isBoundaryNode(fromNodeId, edgeCoords[0])) {
-                spawnWeight *= 2.5;
+            if (
+                spawnWeight > 0 &&
+                (isAtMapBorder(fromNodeId, edgeCoords[0]) || isBoundaryNode(fromNodeId, edgeCoords[0]))
+            ) {
+                spawnWeight *= profile.isHighwaySpawn ? 2.5 : 1.6;
             }
             if (isClosed) {
                 spawnWeight = 0;
@@ -1252,6 +1320,19 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
         }
     }
 
+    for (const edge of edges.values()) {
+        if (edge.isClosed || !edge.isDrivableDirection) continue;
+        if ((outgoing.get(edge.id)?.length ?? 0) === 0 && !edge.isMapBorderExit) {
+            edge.spawnWeight = 0;
+            if (
+                isDrivableLeafEndpoint(edge.toNodeId, edgeEndCoord(edge)) &&
+                Boolean(getOppositeOpenEdge(edge))
+            ) {
+                edge.isDeadEnd = true;
+            }
+        }
+    }
+
     const allOpenEdges = Array.from(edges.values()).filter((e) => !e.isClosed && e.isDrivableDirection);
 
     // Index incoming legal transitions and outgoing legal counts across open edges
@@ -1350,14 +1431,12 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
         if (edge) edge.destWeight = 0;
     }
 
-    // Build spawn and destination weighted pools
-    let spawnCandidates = allOpenEdges.filter(
-        (e) => getRoadProfile(e.roadType).isHighwaySpawn && e.spawnWeight > 0
-    );
-    if (spawnCandidates.length === 0) {
-        // Fallback if zoomed into a local neighborhood with no highways
-        spawnCandidates = allOpenEdges.filter((e) => e.spawnWeight > 0);
-    }
+    // Build spawn and destination weighted pools (prioritizing segments intersecting expanded viewport)
+    const allSpawnable = allOpenEdges.filter((e) => e.spawnWeight > 0);
+    const nearViewportSpawns = raw.viewportBBox
+        ? allSpawnable.filter((e) => edgeIntersectsExpandedViewport(e, raw.viewportBBox!))
+        : allSpawnable;
+    const spawnCandidates = nearViewportSpawns.length > 0 ? nearViewportSpawns : allSpawnable;
 
     const spawnEdgeIds = spawnCandidates.map((e) => e.id);
     const spawnCumulativeWeights = buildCumulativeWeights(
@@ -1366,23 +1445,46 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
         (e) => e.spawnWeight
     );
 
-    const destCandidates = allOpenEdges.filter((e) => e.destWeight > 0);
+    const allDestable = allOpenEdges.filter((e) => e.destWeight > 0);
+    const nearViewportDests = raw.viewportBBox
+        ? allDestable.filter((e) => edgeIntersectsExpandedViewport(e, raw.viewportBBox!))
+        : allDestable;
+    const destCandidates = nearViewportDests.length > 0 ? nearViewportDests : allDestable;
     const destEdgeIds = destCandidates.map((e) => e.id);
     const destCumulativeWeights = buildCumulativeWeights(destEdgeIds, edges, (e) => e.destWeight);
 
-    // Forward reachability from spawns and map-border entries
+    // Forward reachability anchored to map-border entries and highways (or anchored components on street-only maps)
     const legallyReachableDestIds = new Set<string>();
     const fwdQueue: string[] = [];
-    for (const id of spawnEdgeIds) {
-        if (!legallyReachableDestIds.has(id)) {
-            legallyReachableDestIds.add(id);
-            fwdQueue.push(id);
-        }
-    }
     for (const e of allOpenEdges) {
-        if (!legallyReachableDestIds.has(e.id) && isAtMapBorder(e.fromNodeId, edgeStartCoord(e))) {
+        if (isAtMapBorder(e.fromNodeId, edgeStartCoord(e))) {
             legallyReachableDestIds.add(e.id);
             fwdQueue.push(e.id);
+        }
+    }
+    for (const e of spawnCandidates) {
+        if (getRoadProfile(e.roadType).isHighwaySpawn && !legallyReachableDestIds.has(e.id)) {
+            legallyReachableDestIds.add(e.id);
+            fwdQueue.push(e.id);
+        }
+    }
+    if (fwdQueue.length === 0) {
+        for (const e of spawnCandidates) {
+            if (
+                isAnchoredComponent(componentBySegId.get(e.segmentId) ?? -1) &&
+                !legallyReachableDestIds.has(e.id)
+            ) {
+                legallyReachableDestIds.add(e.id);
+                fwdQueue.push(e.id);
+            }
+        }
+    }
+    if (fwdQueue.length === 0) {
+        for (const id of spawnEdgeIds) {
+            if (!legallyReachableDestIds.has(id)) {
+                legallyReachableDestIds.add(id);
+                fwdQueue.push(id);
+            }
         }
     }
     for (let qi = 0; qi < fwdQueue.length; qi++) {

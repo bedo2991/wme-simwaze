@@ -379,9 +379,9 @@ export class SimSidebarUI {
                 <div class="wme-sim-slider-field">
                     <div class="wme-sim-slider-head">
                         <label for="wme-sim-max-wazers">Max Wazers</label>
-                        <span id="wme-sim-max-wazers-val" class="wme-sim-val">120 Wazers</span>
+                        <span id="wme-sim-max-wazers-val" class="wme-sim-val">42 Wazers</span>
                     </div>
-                    <input type="range" id="wme-sim-max-wazers" class="wme-sim-slider" min="20" max="300" step="10" value="120">
+                    <input type="range" id="wme-sim-max-wazers" class="wme-sim-slider" min="2" max="150" step="2" value="42">
                 </div>
 
                 <div class="wme-sim-slider-field">
@@ -447,7 +447,7 @@ export class SimSidebarUI {
                     <summary>Road Capacity &amp; Spawn Rules</summary>
                     <div class="wme-sim-details-body">
                         <p class="wme-sim-note">
-                            Wazers spawn primarily on highways and route to local streets using real speed limits, turn permissions, and active road closures.
+                            Wazers spawn across all drivable roads weighted by road importance and prioritize higher-tier roads while obeying real speed limits, turn permissions, and active closures.
                         </p>
                         <ul class="wme-sim-legend">${legendRows}</ul>
                     </div>
