@@ -1,0 +1,28 @@
+{
+  "version": "1.0.0",
+  "name": "wme-simwaze",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.1",
+    "@rollup/plugin-strip": "^3.0.4",
+    "@rollup/plugin-terser": "^1.0.0",
+    "@rollup/plugin-typescript": "^12.1.2",
+    "@types/geojson": "^7946.0.14",
+    "rollup": "^4.41.0",
+    "tslib": "^2.7.0",
+    "typescript": "^5.6.3",
+    "wme-sdk-typings": "https://web-assets.waze.com/wme_sdk_docs/production/latest/wme-sdk-typings.tgz"
+  },
+  "scripts": {
+    "compile": "rollup -c",
+    "watch": "rollup -c --watch",
+    "concat": "node -e \"const fs = require('fs'); const concat = require('concat'); const pkg = require('./package.json'); fs.mkdirSync('releases', { recursive: true }); concat(['header.js', '.out/main.user.js'], 'releases/release-' + pkg.version + '.user.js').catch(e => { console.error(e); process.exit(1); });\"",
+    "build": "npm run compile && npm run concat",
+    "release": "node -e \"const fs = require('fs'); const pkg = require('./package.json'); const h = fs.readFileSync('header.js', 'utf8'); fs.writeFileSync('header.js', h.replace(/\\d+\\.\\d+\\.\\d+/, pkg.version));\" && cross-env NODE_ENV=production npm run build",
+    "test": "npx rollup --input tests/sim.test.ts --file .out/sim.test.cjs --format cjs --plugin @rollup/plugin-node-resolve --plugin @rollup/plugin-commonjs --plugin @rollup/plugin-typescript && node .out/sim.test.cjs"
+  },
+  "dependencies": {
+    "concat": "^1.0.3",
+    "cross-env": "^7.0.3"
+  }
+}

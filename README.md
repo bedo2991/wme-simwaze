@@ -1,0 +1,31 @@
+# SimWaze — Live Traffic & Chaos Simulator
+
+Turn the Waze Map Editor (WME) into a living, breathing, top-down traffic simulator!
+
+## Features
+
+- **Real WME Network Physics:** Tiny Wazers spawn primarily on highways (Freeways, Major/Minor Highways, Ramps) and navigate to random destination streets using your actual **turn restrictions**, **speed limits** (km/h or mph), **one-way directions**, **lane capacities**, and **active road closures**.
+- **Road-Type Capacity & Multi-Lane Flow:** Multi-lane freeways support dense, fast-moving streams with lane-changing, while narrow local streets and alleys saturate quickly and back up if fed by heavy highway traffic.
+- **Chaos Bug Detector:** If you accidentally leave a **disconnected node** (including tiny unmerged phantom gaps), an **impossible turn restriction**, a **one-way trap**, or an un-detourable **road closure**, Wazers legally drive right up to the mistake, pile up in a growing traffic jam, honk tiny horns (`BEEP!`), and eventually catch fire!
+- **Chaos Radar & Instant Live Recovery:** Open the **SimWaze** sidebar tab to click any burning hotspot—your map centers directly on the broken node or segment. Fix the turn or connect the node, and watch the fire extinguish as the jam clears in real time!
+- **Optional Tiny SFX & Overlays:** Toggle synthesized Web Audio car horns & fire crackle, congestion heatmap glow, hover route previews, and floating bug badges.
+
+## Installation Instructions
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/) (or another userscript manager).
+2. Install **SimWaze** from the latest release (`releases/release-<version>.user.js`).
+3. Open the Waze Map Editor at zoom level **12+** and open the **SimWaze** tab in the Scripts sidebar (or press `Alt + Shift + S` to toggle simulation).
+
+## Development
+
+```bash
+npm install
+npm test
+npx tsc --noEmit
+npm run build      # Development bundle -> releases/release-<version>.user.js
+npm run release    # Minified production bundle
+```
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

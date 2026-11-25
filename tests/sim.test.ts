@@ -1,0 +1,1234 @@
+import type {
+    PermanentHazard,
+    RoadClosure,
+    Segment,
+    Street,
+    Turn,
+    Node as WmeNode,
+} from "wme-sdk-typings";
+import { buildRoadGraphFromRawData, RawGraphInput } from "../src/graph";
+import { WME_ROAD_TYPE as ROAD_TYPE } from "../src/roadProfiles";
+import { findRoute, hasEnabledOutgoingTurn } from "../src/router";
+import { TrafficSimulator } from "../src/simulator";
+import { DEFAULT_SIM_SETTINGS, MIN_SIM_ZOOM } from "../src/types";
+
+function assertOk(cond: unknown, msg: string): asserts cond {
+    if (!cond) {
+        throw new Error(`Assertion failed: ${msg}`);
+    }
+}
+
+function assertEqual<T>(actual: T, expected: T, msg: string): void {
+    if (actual !== expected) {
+        throw new Error(`Assertion failed (${msg}): expected ${String(expected)}, got ${String(actual)}`);
+    }
+}
+
+function assertDeepEqual(actual: unknown, expected: unknown, msg: string): void {
+    const a = JSON.stringify(actual);
+    const e = JSON.stringify(expected);
+    if (a !== e) {
+        throw new Error(`Assertion failed (${msg}): expected ${e}, got ${a}`);
+    }
+}
+
+function makeSegment(
+    id: number,
+    coords: [number, number][],
+    opts: Partial<Segment> = {}
+): Segment {
+    return {
+        allowNoDirection: false,
+        alternateStreetIds: [],
+        areFwdTurnsVerified: true,
+        areRevTurnsVerified: true,
+        elevationLevel: 0,
+        flagAttributes: {
+            beacons: false,
+            fwdLanesEnabled: false,
+            fwdSpeedCamera: false,
+            headlights: false,
+            nearbyHOV: false,
+            revLanesEnabled: false,
+            revSpeedCamera: false,
+            tunnel: false,
+            unpaved: false,
+        },
+        fromLanesInfo: null,
+        fromNodeId: id * 10,
+        fromNodeLanesCount: 0,
+        fwdSpeedLimit: null,
+        geometry: { type: "LineString", coordinates: coords },
+        hasClosures: false,
+        hasHouseNumbers: false,
+        hasRestrictions: false,
+        hasSeparator: false,
+        id,
+        isAtoB: false,
+        isBtoA: false,
+        isDrivable: true,
+        isFwdSpeedLimitVerified: true,
+        isRevSpeedLimitVerified: true,
+        isTwoWay: true,
+        junctionId: null,
+        length: 120,
+        lockRank: 0,
+        modificationData: {
+            createdBy: null,
+            createdOn: null,
+            updatedBy: null,
+            updatedOn: null,
+        },
+        primaryStreetId: id,
+        rank: 0,
+        restrictions: [],
+        revSpeedLimit: null,
+        roadType: ROAD_TYPE.STREET,
+        routingRoadType: null,
+        toLanesInfo: null,
+        toNodeId: id * 10 + 1,
+        toNodeLanesCount: 0,
+        ...opts,
+    };
+}
+
+function makeNode(id: number, lon: number, lat: number, connectedSegmentIds: number[]): WmeNode {
+    return {
+        id,
+        geometry: { type: "Point", coordinates: [lon, lat] },
+        connectedSegmentIds,
+    };
+}
+
+function makeStreet(id: number, name: string): Street {
+    return {
+        id,
+        name,
+        cityId: 1,
+        direction: null,
+        englishName: name,
+        isEmpty: false,
+        signText: null,
+        signType: null,
+        modificationData: {
+            createdBy: null,
+            createdOn: null,
+            updatedBy: null,
+            updatedOn: null,
+        },
+    };
+}
+
+function makeTurn(
+    fromSegmentId: number,
+    fromSegmentFwd: boolean,
+    toSegmentId: number,
+    toSegmentFwd: boolean,
+    isAllowed: boolean
+): Turn {
+    return {
+        id: `${fromSegmentId}:${fromSegmentFwd}-${toSegmentId}:${toSegmentFwd}`,
+        fromSegmentId,
+        fromSegmentFwd,
+        toSegmentId,
+        toSegmentFwd,
+        isAllowed,
+        isJunctionBoxTurn: false,
+        isPathTurn: false,
+        isUTurn: false,
+        hasCustomTTS: false,
+        hasShieldsPopulated: false,
+        hasTowardsGuidance: false,
+        hasTurnGuidance: false,
+        hasVisualInstruction: false,
+        instructionOpCode: null,
+        lanes: null,
+        restrictions: [],
+        segmentPath: [],
+        turnGuidance: null,
+    };
+}
+
+function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
+    return {
+        segments: [],
+        nodes: [],
+        turns: [],
+        roadClosures: [],
+        turnClosures: [],
+        streets: [],
+        isLeftHandTraffic: false,
+        isImperial: false,
+        ...overrides,
+    };
+}
+
+// 1. Road capacities & highway spawning
+{
+    const raw = baseRaw({
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.002, 45.0]], {
+                roadType: ROAD_TYPE.FREEWAY,
+                fromNodeId: 100,
+                toNodeId: 101,
+                isTwoWay: false,
+                isAtoB: true,
+                length: 200,
+            }),
+            makeSegment(2, [[12.002, 45.0], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 101,
+                toNodeId: 102,
+                length: 100,
+            }),
+            makeSegment(3, [[12.003, 45.0], [12.004, 45.0]], {
+                roadType: ROAD_TYPE.ALLEY,
+                fromNodeId: 102,
+                toNodeId: 103,
+                length: 80,
+            }),
+        ],
+        nodes: [
+            makeNode(100, 12.0, 45.0, [1]),
+            makeNode(101, 12.002, 45.0, [1, 2]),
+            makeNode(102, 12.003, 45.0, [2, 3]),
+            makeNode(103, 12.004, 45.0, [3]),
+        ],
+        streets: [makeStreet(1, "A4 Freeway"), makeStreet(2, "Main St"), makeStreet(3, "Back Alley")],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    const fwy = graph.edges.get("1:F")!;
+    const st = graph.edges.get("2:F")!;
+    const alley = graph.edges.get("3:F")!;
+
+    assertOk(fwy, "Freeway forward edge exists");
+    assertEqual(graph.edges.get("1:R"), undefined, "One-way freeway has no reverse edge");
+    assertOk(fwy.lanes > st.lanes, "Freeway has more lanes than Street");
+    assertOk(fwy.maxCapacity > st.maxCapacity, "Freeway supports more Wazers than Street");
+    assertOk(fwy.spawnWeight > st.spawnWeight, "Freeway has higher spawnWeight than Street");
+    assertEqual(alley.spawnWeight, 0, "Alley does not spawn highway traffic");
+    assertOk(alley.destWeight > fwy.destWeight, "Alley has higher destination weight than Freeway");
+    assertDeepEqual(graph.spawnEdgeIds, ["1:F"], "Only highway edges are primary spawners when present");
+    console.log("PASS: Test 1 — Road capacities & highway spawning");
+}
+
+// 2. Speed limits & imperial conversion
+{
+    const raw = baseRaw({
+        isImperial: true,
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                fromNodeId: 1,
+                toNodeId: 2,
+                fwdSpeedLimit: 60, // 60 mph ~ 96.5 km/h
+            }),
+            // Fast upper branch: 2 -> 3 -> 5 (50 mph)
+            makeSegment(2, [[12.001, 45.0], [12.002, 45.001]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                fwdSpeedLimit: 50,
+            }),
+            makeSegment(3, [[12.002, 45.001], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 3,
+                toNodeId: 5,
+                fwdSpeedLimit: 50,
+            }),
+            // Slow lower branch: 2 -> 4 -> 5 (15 mph)
+            makeSegment(4, [[12.001, 45.0], [12.002, 44.999]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 4,
+                fwdSpeedLimit: 15,
+            }),
+            makeSegment(5, [[12.002, 44.999], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 4,
+                toNodeId: 5,
+                fwdSpeedLimit: 15,
+            }),
+            makeSegment(6, [[12.003, 45.0], [12.004, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 5,
+                toNodeId: 6,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 12.0, 45.0, [1]),
+            makeNode(2, 12.001, 45.0, [1, 2, 4]),
+            makeNode(3, 12.002, 45.001, [2, 3]),
+            makeNode(4, 12.002, 44.999, [4, 5]),
+            makeNode(5, 12.003, 45.0, [3, 5, 6]),
+            makeNode(6, 12.004, 45.0, [6]),
+        ],
+        streets: [makeStreet(1, "Hwy 1"), makeStreet(6, "Oak St")],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    const hwy = graph.edges.get("1:F")!;
+    assertOk(hwy.speedKmh > 95 && hwy.speedKmh < 98, "60 mph converted to ~96.5 km/h");
+
+    const route = findRoute(graph, "1:F", "6:F", new Map());
+    assertOk(route, "Route found");
+    assertEqual(route.terminalBug, null, "No terminal bug on speed route");
+    assertDeepEqual(route.routeEdgeIds, ["1:F", "2:F", "3:F", "6:F"], "Router picks faster 50 mph branch");
+    console.log("PASS: Test 2 — Speed limits & imperial conversion");
+}
+
+// 3. Road closures avoidance (directional)
+{
+    const closure: RoadClosure = {
+        id: "closure-1",
+        segmentId: 2,
+        isForward: true,
+        isPermanent: true,
+        status: "ACTIVE",
+        description: "Water main repair",
+        startDate: null,
+        endDate: null,
+        trafficEventId: null,
+        attributions: [],
+        modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+    };
+
+    const raw = baseRaw({
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                fromNodeId: 1,
+                toNodeId: 2,
+            }),
+            makeSegment(2, [[12.001, 45.0], [12.002, 45.001]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                fwdSpeedLimit: 80,
+                hasClosures: true,
+            }),
+            makeSegment(3, [[12.002, 45.001], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 3,
+                toNodeId: 5,
+                fwdSpeedLimit: 80,
+            }),
+            makeSegment(4, [[12.001, 45.0], [12.002, 44.999]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 2,
+                toNodeId: 4,
+                fwdSpeedLimit: 40,
+            }),
+            makeSegment(5, [[12.002, 44.999], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 4,
+                toNodeId: 5,
+                fwdSpeedLimit: 40,
+            }),
+            makeSegment(6, [[12.003, 45.0], [12.004, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 5,
+                toNodeId: 6,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 12.0, 45.0, [1]),
+            makeNode(2, 12.001, 45.0, [1, 2, 4]),
+            makeNode(3, 12.002, 45.001, [2, 3]),
+            makeNode(4, 12.002, 44.999, [4, 5]),
+            makeNode(5, 12.003, 45.0, [3, 5, 6]),
+            makeNode(6, 12.004, 45.0, [6]),
+        ],
+        roadClosures: [closure],
+        streets: [makeStreet(2, "Closed Ave"), makeStreet(4, "Detour Rd"), makeStreet(6, "Goal St")],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    assertEqual(graph.edges.get("2:F")!.isClosed, true, "Forward direction of seg 2 is closed");
+    assertEqual(graph.edges.get("2:R")!.isClosed, false, "Reverse direction of seg 2 remains open");
+
+    const route = findRoute(graph, "1:F", "6:F", new Map());
+    assertOk(route, "Detour route found");
+    assertEqual(route.terminalBug, null, "No terminal bug when detour exists");
+    assertDeepEqual(route.routeEdgeIds, ["1:F", "4:F", "5:F", "6:F"], "Router detours around active closure");
+    console.log("PASS: Test 3 — Road closures avoidance");
+}
+
+// 4. Impossible turn restriction -> pileup, honk, fire, and live fix recovery
+{
+    const buildTurnTestGraph = (allowed: boolean) =>
+        buildRoadGraphFromRawData(
+            baseRaw({
+                segments: [
+                    makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                        roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                        fromNodeId: 10,
+                        toNodeId: 100,
+                        length: 80,
+                    }),
+                    makeSegment(2, [[12.001, 45.0], [12.002, 45.0]], {
+                        roadType: ROAD_TYPE.STREET,
+                        fromNodeId: 100,
+                        toNodeId: 101,
+                        length: 80,
+                    }),
+                ],
+                nodes: [
+                    makeNode(10, 12.0, 45.0, [1]),
+                    makeNode(100, 12.001, 45.0, [1, 2]),
+                    makeNode(101, 12.002, 45.0, [2]),
+                ],
+                turns: [makeTurn(1, true, 2, true, allowed)],
+                streets: [makeStreet(1, "Highway 9"), makeStreet(2, "Blocked St")],
+            })
+        );
+
+    const brokenGraph = buildTurnTestGraph(false);
+    const route = findRoute(brokenGraph, "1:F", "2:F", new Map());
+    assertOk(route, "Diagnostic route returned");
+    assertOk(route.terminalBug, "Terminal bug detected for disallowed turn");
+    assertEqual(route.terminalBug.kind, "DISALLOWED_TURN", "Bug kind is DISALLOWED_TURN");
+    assertDeepEqual(route.routeEdgeIds, ["1:F"], "Wazer stops before illegal turn");
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, patienceSeconds: 6 },
+        { rng: () => 0.1 }
+    );
+    sim.setGraph(brokenGraph);
+    const w = sim.spawnSpecificWazer("1:F", "2:F");
+    assertOk(w, "Wazer spawned");
+
+    let sawHonking = false;
+    let sawFire = false;
+    for (let i = 0; i < 160; i++) {
+        sim.step(0.1);
+        const cur = sim.getWazers()[0];
+        assertOk(cur, "Wazer remains trapped on edge 1:F");
+        assertEqual(cur.edgeId, "1:F", "Wazer never violates turn restriction");
+        if (cur.state === "HONKING") sawHonking = true;
+        if (cur.state === "ON_FIRE") sawFire = true;
+    }
+
+    assertOk(sawHonking, "Wazer honked while trapped at disallowed turn");
+    assertOk(sawFire, "Wazer caught fire after exceeding patience");
+
+    const hotspots = sim.getHotspots();
+    assertOk(hotspots.length >= 1, "Hotspot emitted");
+    assertEqual(hotspots[0].kind, "DISALLOWED_TURN", "Hotspot kind is DISALLOWED_TURN");
+    assertOk(hotspots[0].burningCount >= 1, "Hotspot has burning Wazer");
+
+    // Now the editor enables the turn!
+    const fixedGraph = buildTurnTestGraph(true);
+    sim.setGraph(fixedGraph);
+    assertEqual(sim.getWazers()[0].state, "CRUISING", "Fire extinguished immediately when fixed");
+    assertEqual(sim.getWazers()[0].terminalBug, null, "Terminal bug cleared on fix");
+
+    for (let i = 0; i < 120; i++) {
+        sim.step(0.1);
+    }
+    assertOk(sim.getStats().arrivedCount >= 1, "Wazer drove through fixed turn and arrived");
+    console.log("PASS: Test 4 — Impossible turn restriction chaos & live fix recovery");
+}
+
+// 5. Disconnected node ("phantom gap") chaos & connection recovery
+{
+    const buildGapGraph = (connected: boolean) =>
+        buildRoadGraphFromRawData(
+            baseRaw({
+                segments: [
+                    makeSegment(10, [[12.0, 45.0], [12.001, 45.0]], {
+                        roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                        fromNodeId: 200,
+                        toNodeId: 201,
+                        length: 80,
+                    }),
+                    makeSegment(
+                        20,
+                        connected
+                            ? [
+                                  [12.001, 45.0],
+                                  [12.002, 45.0],
+                              ]
+                            : [
+                                  [12.00107, 45.0], // ~5.5m gap
+                                  [12.002, 45.0],
+                              ],
+                        {
+                            roadType: ROAD_TYPE.STREET,
+                            fromNodeId: connected ? 201 : null,
+                            toNodeId: 202,
+                            length: 80,
+                        }
+                    ),
+                ],
+                nodes: [
+                    makeNode(200, 12.0, 45.0, [10]),
+                    makeNode(201, 12.001, 45.0, connected ? [10, 20] : [10]),
+                    makeNode(202, 12.002, 45.0, [20]),
+                ],
+                turns: connected ? [makeTurn(10, true, 20, true, true)] : [],
+                streets: [makeStreet(10, "Expressway"), makeStreet(20, "Orphan St")],
+            })
+        );
+
+    const gapGraph = buildGapGraph(false);
+    const gapRoute = findRoute(gapGraph, "10:F", "20:F", new Map());
+    assertOk(gapRoute, "Diagnostic gap route returned");
+    assertOk(gapRoute.terminalBug, "Terminal bug detected for phantom gap");
+    assertEqual(gapRoute.terminalBug.kind, "DISCONNECTED_NODE", "Phantom gap detected as DISCONNECTED_NODE");
+    assertDeepEqual(gapRoute.routeEdgeIds, ["10:F"], "Stops before phantom gap");
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, patienceSeconds: 5, maxWazers: 6 },
+        { rng: () => 0.1 }
+    );
+    sim.setGraph(gapGraph);
+    sim.spawnSpecificWazer("10:F", "20:F");
+    sim.spawnSpecificWazer("10:F", "20:F");
+
+    for (let i = 0; i < 140; i++) {
+        sim.step(0.1);
+    }
+
+    const hotspots = sim.getHotspots();
+    assertOk(hotspots.length >= 1, "Disconnected hotspot created");
+    assertEqual(hotspots[0].kind, "DISCONNECTED_NODE", "Hotspot kind is DISCONNECTED_NODE");
+    assertOk(hotspots[0].burningCount >= 1, "Multiple Wazers burning at disconnected node");
+
+    // Editor connects the node
+    sim.setGraph(buildGapGraph(true));
+    for (let i = 0; i < 120; i++) {
+        sim.step(0.1);
+    }
+    assertOk(sim.getStats().arrivedCount >= 1, "Connected node clears jam and lets Wazers arrive");
+    console.log("PASS: Test 5 — Disconnected node phantom gap chaos & recovery");
+}
+
+// 6. Roundabout entrance/exit flare branches & continuing roads are NOT dead ends
+{
+    const buildRoundaboutScenario = (allowPathTurn: boolean) =>
+        buildRoadGraphFromRawData(
+            baseRaw({
+                viewportBBox: [11.999, 44.9985, 12.006, 45.0025],
+                segments: [
+                    // Approach road -> split node 100
+                    makeSegment(1, [[11.999, 45.0], [12.001, 45.0]], {
+                        roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                        fromNodeId: 10,
+                        toNodeId: 100,
+                        length: 140,
+                    }),
+                    // Entrance branch (one-way 100 -> 101 into roundabout)
+                    makeSegment(2, [[12.001, 45.0], [12.0014, 44.9998]], {
+                        roadType: ROAD_TYPE.PRIMARY_STREET,
+                        fromNodeId: 100,
+                        toNodeId: 101,
+                        isTwoWay: false,
+                        isAtoB: true,
+                        length: 35,
+                    }),
+                    // Roundabout ring seg 1 (101 -> 102)
+                    makeSegment(3, [[12.0014, 44.9998], [12.0018, 45.0002]], {
+                        roadType: ROAD_TYPE.PRIMARY_STREET,
+                        fromNodeId: 101,
+                        toNodeId: 102,
+                        junctionId: 500,
+                        isTwoWay: false,
+                        isAtoB: true,
+                        length: 35,
+                    }),
+                    // Roundabout ring seg 2 (102 -> 101)
+                    makeSegment(4, [[12.0018, 45.0002], [12.0014, 44.9998]], {
+                        roadType: ROAD_TYPE.PRIMARY_STREET,
+                        fromNodeId: 102,
+                        toNodeId: 101,
+                        junctionId: 500,
+                        isTwoWay: false,
+                        isAtoB: true,
+                        length: 35,
+                    }),
+                    // Exit branch (one-way 102 -> 103 to continuing road)
+                    makeSegment(5, [[12.0018, 45.0002], [12.0024, 45.0]], {
+                        roadType: ROAD_TYPE.PRIMARY_STREET,
+                        fromNodeId: 102,
+                        toNodeId: 103,
+                        isTwoWay: false,
+                        isAtoB: true,
+                        length: 45,
+                    }),
+                    // Continuing road after exit branch (103 -> 104)
+                    makeSegment(6, [[12.0024, 45.0], [12.004, 45.0]], {
+                        roadType: ROAD_TYPE.STREET,
+                        fromNodeId: 103,
+                        toNodeId: 104,
+                        length: 120,
+                    }),
+                    // Flare hairpin branch back toward roundabout (103 -> 101) with disallowed acute V-turn
+                    makeSegment(7, [[12.0024, 45.0], [12.0014, 44.9998]], {
+                        roadType: ROAD_TYPE.PRIMARY_STREET,
+                        fromNodeId: 103,
+                        toNodeId: 101,
+                        isTwoWay: false,
+                        isAtoB: true,
+                        length: 65,
+                    }),
+                    // Separate viewport-clipped corridor across the map
+                    makeSegment(50, [[11.999, 45.002], [12.006, 45.002]], {
+                        roadType: ROAD_TYPE.FREEWAY,
+                        fromNodeId: 5000,
+                        toNodeId: 5001,
+                        isTwoWay: false,
+                        isAtoB: true,
+                        length: 400,
+                    }),
+                ],
+                nodes: [
+                    makeNode(10, 11.999, 45.0, [1]),
+                    makeNode(100, 12.001, 45.0, [1, 2]),
+                    makeNode(101, 12.0014, 44.9998, [2, 3, 4, 7]),
+                    makeNode(102, 12.0018, 45.0002, [3, 4, 5]),
+                    makeNode(103, 12.0024, 45.0, [5, 6, 7]),
+                    makeNode(104, 12.004, 45.0, [6]),
+                    makeNode(5000, 11.999, 45.002, [50]),
+                    makeNode(5001, 12.006, 45.002, [50]),
+                ],
+                turns: [
+                    makeTurn(1, true, 2, true, true),
+                    makeTurn(5, true, 6, true, true),
+                    makeTurn(5, true, 7, true, false), // Disallowed flare hairpin V-turn
+                    {
+                        ...makeTurn(2, true, 5, true, allowPathTurn),
+                        isPathTurn: true,
+                        segmentPath: [3],
+                    },
+                    {
+                        ...makeTurn(7, true, 5, true, allowPathTurn),
+                        isPathTurn: true,
+                        segmentPath: [3],
+                    },
+                ],
+                // Simulate single-node isTurnAllowed returning false at roundabout nodes
+                fallbackTurnAllowed: new Map([
+                    ["2:1->3:1", false],
+                    ["3:1->5:1", false],
+                ]),
+                streets: [
+                    makeStreet(1, "West Ave"),
+                    makeStreet(6, "East Blvd"),
+                    makeStreet(50, "Outer Freeway"),
+                ],
+            })
+        );
+
+    const healthyGraph = buildRoundaboutScenario(true);
+    assertEqual(hasEnabledOutgoingTurn(healthyGraph, "2:F"), true, "Entrance branch has enabled outgoing turn");
+    assertEqual(hasEnabledOutgoingTurn(healthyGraph, "3:F"), true, "Roundabout ring has enabled outgoing turn");
+    assertEqual(hasEnabledOutgoingTurn(healthyGraph, "5:F"), true, "Exit branch has enabled outgoing turn");
+
+    const throughRoute = findRoute(healthyGraph, "1:F", "6:F", new Map());
+    assertOk(throughRoute, "Route through roundabout found");
+    assertEqual(throughRoute.terminalBug, null, "No false bug on roundabout entrance/exit");
+    assertDeepEqual(
+        throughRoute.routeEdgeIds,
+        ["1:F", "2:F", "3:F", "5:F", "6:F"],
+        "Wazer routes cleanly through roundabout entrance -> ring -> exit -> continuing road"
+    );
+
+    // Routing toward an independent viewport-clipped corridor must NOT fabricate a false DEAD_END on the roundabout
+    const crossCorridorRoute = findRoute(healthyGraph, "1:F", "50:F", new Map());
+    assertEqual(
+        crossCorridorRoute,
+        null,
+        "Unreachable independent viewport corridor does not trigger false dead-end chaos"
+    );
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, patienceSeconds: 5, maxWazers: 1 },
+        { rng: () => 0.1 }
+    );
+    sim.setGraph(healthyGraph);
+    sim.spawnSpecificWazer("1:F", "6:F");
+    for (let i = 0; i < 480; i++) {
+        sim.step(0.1);
+    }
+    assertEqual(sim.getStats().arrivedCount, 1, "Wazer navigated roundabout and arrived");
+    assertEqual(sim.getHotspots().length, 0, "Zero false chaos hotspots on healthy roundabout");
+    console.log("PASS: Test 6 — Roundabout branches & continuing roads have no false dead ends");
+}
+
+// 7. True Dead End (zero enabled turns out of a segment, head-on one-way trap) triggers chaos
+{
+    const raw = baseRaw({
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                fromNodeId: 10,
+                toNodeId: 100,
+                isTwoWay: false,
+                isAtoB: true,
+                length: 80,
+            }),
+            // Opposing one-way pointing INTO node 100 (101 -> 100) so there is zero exit at node 100
+            makeSegment(2, [[12.002, 45.0], [12.001, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 101,
+                toNodeId: 100,
+                isTwoWay: false,
+                isAtoB: true,
+                length: 80,
+            }),
+        ],
+        nodes: [
+            makeNode(10, 12.0, 45.0, [1]),
+            makeNode(100, 12.001, 45.0, [1, 2]),
+            makeNode(101, 12.002, 45.0, [2]),
+        ],
+        streets: [makeStreet(1, "OneWay In"), makeStreet(2, "HeadOn St")],
+    });
+
+    const deadEndGraph = buildRoadGraphFromRawData(raw);
+    assertEqual(
+        hasEnabledOutgoingTurn(deadEndGraph, "1:F"),
+        false,
+        "True dead-end segment has zero enabled outgoing turns"
+    );
+
+    const route = findRoute(deadEndGraph, "1:F", "2:F", new Map());
+    assertOk(route, "Diagnostic dead-end route returned");
+    assertOk(route.terminalBug, "True dead end reports terminal bug");
+    assertEqual(route.terminalBug.kind, "DEAD_END", "Bug kind is DEAD_END");
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, patienceSeconds: 5 },
+        { rng: () => 0.1 }
+    );
+    sim.setGraph(deadEndGraph);
+    sim.spawnSpecificWazer("1:F", "2:F");
+    for (let i = 0; i < 120; i++) {
+        sim.step(0.1);
+    }
+    assertEqual(sim.getHotspots()[0]?.kind, "DEAD_END", "Chaos hotspot confirms true DEAD_END");
+    assertOk(sim.getHotspots()[0]?.burningCount >= 1, "Wazer catches fire at true dead end");
+    console.log("PASS: Test 7 — True dead end (zero enabled turns out) triggers chaos");
+}
+
+// 8. Realistic speed: slower on curves/turns/hazards, slight speeding on open straightaways
+{
+    const bumpHazard: PermanentHazard = {
+        id: 700,
+        type: "SPEED_BUMP",
+        subTypes: [],
+        segmentId: 1,
+        direction: "BOTH",
+        geometry: { type: "Point", coordinates: [12.004, 45.0] },
+        lockRank: 0,
+        rank: 1,
+        modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+    };
+
+    const raw = baseRaw({
+        segments: [
+            // Long straight ~630m Eastbound road (50 km/h = 13.89 m/s) with a speed bump at ~315m
+            makeSegment(1, [[12.0, 45.0], [12.008, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 10,
+                toNodeId: 20,
+                fwdSpeedLimit: 50,
+                length: 630,
+            }),
+            // Sharp 90-degree Northbound turn at node 20 (~330m)
+            makeSegment(2, [[12.008, 45.0], [12.008, 45.003]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 20,
+                toNodeId: 30,
+                fwdSpeedLimit: 50,
+                length: 330,
+            }),
+        ],
+        nodes: [
+            makeNode(10, 12.0, 45.0, [1]),
+            makeNode(20, 12.008, 45.0, [1, 2]),
+            makeNode(30, 12.008, 45.003, [2]),
+        ],
+        permanentHazards: [bumpHazard],
+        streets: [makeStreet(1, "Long Straight"), makeStreet(2, "Turn North")],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    const edge1 = graph.edges.get("1:F")!;
+    assertOk(edge1.speedZones.length >= 1, "Speed bump registered as a speedZone");
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 1 },
+        { rng: () => 0.8 } // cruiseTrait ~ 1.152 (+15.2% on open road)
+    );
+    sim.setGraph(graph);
+    const w = sim.spawnSpecificWazer("1:F", "2:F");
+    assertOk(w, "Wazer spawned");
+
+    let maxOpenStraightSpeed = 0;
+    let minSpeedNearBump = Infinity;
+    let minSpeedAtTurn = Infinity;
+
+    for (let i = 0; i < 600; i++) {
+        sim.step(0.1);
+        const cur = sim.getWazers()[0];
+        if (!cur) break;
+        if (cur.edgeId === "1:F") {
+            if (cur.distOnEdge < 220 && cur.speedMps > maxOpenStraightSpeed) {
+                maxOpenStraightSpeed = cur.speedMps;
+            }
+            if (cur.distOnEdge >= 295 && cur.distOnEdge <= 335 && cur.speedMps < minSpeedNearBump) {
+                minSpeedNearBump = cur.speedMps;
+            }
+            if (cur.distOnEdge >= edge1.lengthMeters - 18 && cur.speedMps < minSpeedAtTurn) {
+                minSpeedAtTurn = cur.speedMps;
+            }
+        }
+    }
+
+    assertOk(
+        maxOpenStraightSpeed > edge1.speedMps * 1.03,
+        `Open road speed (${maxOpenStraightSpeed.toFixed(2)} m/s) exceeds speed limit (${edge1.speedMps.toFixed(2)} m/s)`
+    );
+    assertOk(
+        minSpeedNearBump <= 6.5,
+        `Wazer slowed at speed bump (${minSpeedNearBump.toFixed(2)} m/s)`
+    );
+    assertOk(
+        minSpeedAtTurn <= 8.5,
+        `Wazer slowed for 90-degree turn (${minSpeedAtTurn.toFixed(2)} m/s)`
+    );
+    console.log("PASS: Test 8 — Realistic speed on open roads, hazards, and turns");
+}
+
+// 9. Horizontal facing flips west/left and stays default east/right
+{
+    const raw = baseRaw({
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.002, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 1,
+                toNodeId: 2,
+                length: 150,
+            }),
+            makeSegment(2, [[12.002, 45.0], [12.004, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                length: 150,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 12.0, 45.0, [1]),
+            makeNode(2, 12.002, 45.0, [1, 2]),
+            makeNode(3, 12.004, 45.0, [2]),
+        ],
+        streets: [makeStreet(1, "East-West Rd"), makeStreet(2, "Continuation Rd")],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    const sim = new TrafficSimulator({ ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 2 });
+    sim.setGraph(graph);
+
+    const eastWazer = sim.spawnSpecificWazer("1:F", "2:F");
+    const westWazer = sim.spawnSpecificWazer("2:R", "1:R");
+    assertOk(eastWazer && westWazer, "Both Eastbound and Westbound Wazers spawned");
+    assertEqual(eastWazer.facingLeft, false, "Eastbound Wazer does not flip horizontally");
+    assertEqual(westWazer.facingLeft, true, "Westbound Wazer flips horizontally");
+
+    sim.step(0.5);
+    assertEqual(eastWazer.facingLeft, false, "Eastbound facing preserved after step");
+    assertEqual(westWazer.facingLeft, true, "Westbound facing preserved after step");
+    console.log("PASS: Test 9 — Horizontal flip when moving West vs East");
+}
+
+// 10. One-way segments with allowNoDirection=true never create reverse edges or spawn wrong-way
+{
+    const raw = baseRaw({
+        segments: [
+            // One-way A->B (10 -> 20) even with allowNoDirection=true
+            makeSegment(1, [[12.0, 45.0], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                fromNodeId: 10,
+                toNodeId: 20,
+                isTwoWay: false,
+                isAtoB: true,
+                isBtoA: false,
+                allowNoDirection: true,
+                length: 235,
+            }),
+            // One-way B->A (node B=20 at 12.003 -> node A=30 at 12.006)
+            makeSegment(2, [[12.006, 45.0], [12.003, 45.0]], {
+                roadType: ROAD_TYPE.MAJOR_HIGHWAY,
+                fromNodeId: 30,
+                toNodeId: 20,
+                isTwoWay: false,
+                isAtoB: false,
+                isBtoA: true,
+                allowNoDirection: true,
+                length: 235,
+            }),
+            // One-way A->B destination street (30 -> 40)
+            makeSegment(3, [[12.006, 45.0], [12.009, 45.0]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 30,
+                toNodeId: 40,
+                isTwoWay: false,
+                isAtoB: true,
+                isBtoA: false,
+                allowNoDirection: true,
+                length: 235,
+            }),
+            // One-way A->B (40 -> 50) with accidentally reversed raw coordinates
+            makeSegment(4, [[12.011, 45.0], [12.009, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 40,
+                toNodeId: 50,
+                isTwoWay: false,
+                isAtoB: true,
+                isBtoA: false,
+                allowNoDirection: true,
+                length: 160,
+            }),
+        ],
+        nodes: [
+            makeNode(10, 12.0, 45.0, [1]),
+            makeNode(20, 12.003, 45.0, [1, 2]),
+            makeNode(30, 12.006, 45.0, [2, 3]),
+            makeNode(40, 12.009, 45.0, [3, 4]),
+            makeNode(50, 12.011, 45.0, [4]),
+        ],
+        turns: [
+            makeTurn(1, true, 2, false, true),
+            makeTurn(2, false, 3, true, true),
+            makeTurn(3, true, 4, true, true),
+        ],
+        streets: [
+            makeStreet(1, "OneWay Hwy A->B"),
+            makeStreet(2, "OneWay Hwy B->A"),
+            makeStreet(3, "OneWay Street"),
+            makeStreet(4, "OneWay Exit"),
+        ],
+        viewportBBox: [11.999, 44.998, 12.012, 45.002],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    assertOk(graph.edges.has("1:F") && !graph.edges.has("1:R"), "Seg 1 only has forward edge");
+    assertOk(graph.edges.has("2:R") && !graph.edges.has("2:F"), "Seg 2 only has reverse edge");
+    assertEqual(graph.edges.get("2:R")!.fromNodeId, 20, "Seg 2 reverse starts at node 20");
+    assertEqual(graph.edges.get("2:R")!.toNodeId, 30, "Seg 2 reverse ends at node 30");
+    assertEqual(graph.edges.get("2:R")!.coords[0][0], 12.003, "Seg 2 reverse geometry starts at 12.003");
+    assertEqual(graph.edges.get("2:R")!.coords[1][0], 12.006, "Seg 2 reverse geometry ends at 12.006");
+    assertOk(graph.edges.has("3:F") && !graph.edges.has("3:R"), "Seg 3 only has forward edge");
+    assertOk(graph.edges.has("4:F") && !graph.edges.has("4:R"), "Seg 4 only has forward edge");
+    assertEqual(graph.edges.get("4:F")!.coords[0][0], 12.009, "Seg 4 normalized geometry starts at node 40 (12.009)");
+
+    for (const badId of ["1:R", "2:F", "3:R", "4:R"]) {
+        assertOk(!graph.spawnEdgeIds.includes(badId), `Disallowed edge ${badId} is not in spawnEdgeIds`);
+    }
+    assertOk(graph.spawnEdgeIds.includes("1:F"), "Allowed 1:F is in spawnEdgeIds");
+    assertOk(graph.spawnEdgeIds.includes("2:R"), "Allowed 2:R is in spawnEdgeIds");
+
+    const sim = new TrafficSimulator({ ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 6, patienceSeconds: 10 });
+    sim.setGraph(graph);
+
+    let spawnedCount = 0;
+    for (let s = 0; s < 6; s++) {
+        if (sim.spawnRandomWazer()) spawnedCount++;
+        sim.step(0.6);
+    }
+    assertOk(spawnedCount >= 4, `Spawned Wazers on one-way network (got ${spawnedCount})`);
+
+    for (let i = 0; i < 500; i++) {
+        sim.step(0.1);
+        for (const w of sim.getWazers()) {
+            assertOk(
+                w.edgeId === "1:F" || w.edgeId === "2:R" || w.edgeId === "3:F" || w.edgeId === "4:F",
+                `Wazer ${w.id} stayed on allowed one-way direction (edge=${w.edgeId})`
+            );
+            assertEqual(w.terminalBug, null, `Wazer ${w.id} has no terminal routing bug on one-way street`);
+            assertEqual(w.facingLeft, false, `Wazer ${w.id} travels eastbound with traffic`);
+            assertOk(
+                w.state === "CRUISING",
+                `Wazer ${w.id} flows smoothly without getting stuck at entrance node (state=${w.state}, edge=${w.edgeId}, dist=${w.distOnEdge.toFixed(1)}, dest=${w.destEdgeId})`
+            );
+        }
+    }
+    assertOk(sim.getStats().arrivedCount >= 1, "Wazers completed one-way route and exited cleanly");
+    console.log("PASS: Test 10 — One-way segments always spawn and drive in allowed direction");
+}
+
+// 11. German Autobahn (unrestricted Freeway 130-190 km/h), isolated corridor spawning & min zoom 16
+{
+    assertEqual(MIN_SIM_ZOOM, 16, "Minimum simulation zoom is 16");
+
+    const localSegments: Segment[] = [];
+    const localNodes: WmeNode[] = [];
+    const localStreets: Street[] = [
+        makeStreet(101, "A9 Autobahn Süd"),
+        makeStreet(102, "A9 Autobahn Süd"),
+        makeStreet(201, "A9 Autobahn Nord"),
+    ];
+
+    // 20 unreachable village streets below the grade-separated Autobahn to dominate destEdgeIds
+    for (let k = 0; k < 20; k++) {
+        const segId = 500 + k;
+        const nA = 5000 + k * 2;
+        const nB = nA + 1;
+        const lonA = 12.002 + (k % 5) * 0.003;
+        const latA = 44.997 + Math.floor(k / 5) * 0.0005;
+        localSegments.push(
+            makeSegment(segId, [[lonA, latA], [lonA + 0.002, latA]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: nA,
+                toNodeId: nB,
+                length: 160,
+            })
+        );
+        localNodes.push(makeNode(nA, lonA, latA, [segId]));
+        localNodes.push(makeNode(nB, lonA + 0.002, latA, [segId]));
+        localStreets.push(makeStreet(segId, `Village St ${k + 1}`));
+    }
+
+    const raw = baseRaw({
+        segments: [
+            // Eastbound Autobahn: 2 segments, no speed limit (fwdSpeedLimit: null)
+            makeSegment(101, [[11.995, 45.001], [12.010, 45.001]], {
+                roadType: ROAD_TYPE.FREEWAY,
+                fromNodeId: 1001,
+                toNodeId: 1002,
+                isTwoWay: false,
+                isAtoB: true,
+                fwdSpeedLimit: null,
+                length: 1180,
+            }),
+            makeSegment(102, [[12.010, 45.001], [12.025, 45.001]], {
+                roadType: ROAD_TYPE.FREEWAY,
+                fromNodeId: 1002,
+                toNodeId: 1003,
+                isTwoWay: false,
+                isAtoB: true,
+                fwdSpeedLimit: null,
+                length: 1180,
+            }),
+            // Westbound Autobahn: single 2.4km segment spanning across viewport, speed limit 0 (unrestricted)
+            makeSegment(201, [[12.025, 45.0015], [11.995, 45.0015]], {
+                roadType: ROAD_TYPE.FREEWAY,
+                fromNodeId: 2001,
+                toNodeId: 2002,
+                isTwoWay: false,
+                isAtoB: true,
+                fwdSpeedLimit: 0,
+                length: 2360,
+            }),
+            ...localSegments,
+        ],
+        nodes: [
+            makeNode(1001, 11.995, 45.001, [101]),
+            makeNode(1002, 12.010, 45.001, [101, 102]),
+            makeNode(1003, 12.025, 45.001, [102]),
+            makeNode(2001, 12.025, 45.0015, [201]),
+            makeNode(2002, 11.995, 45.0015, [201]),
+            ...localNodes,
+        ],
+        turns: [makeTurn(101, true, 102, true, true)],
+        streets: localStreets,
+        viewportBBox: [12.0, 44.996, 12.02, 45.004],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    for (const edgeId of ["101:F", "102:F", "201:F"]) {
+        const edge = graph.edges.get(edgeId)!;
+        assertOk(edge, `${edgeId} exists`);
+        assertOk(edge.hasUnrestrictedSpeed, `${edgeId} marked hasUnrestrictedSpeed`);
+        assertOk(
+            edge.speedKmh >= 130 && edge.speedKmh <= 190,
+            `${edgeId} speed ${edge.speedKmh} km/h in 130-190 range`
+        );
+    }
+
+    const sim = new TrafficSimulator({ ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 16 });
+    sim.setGraph(graph);
+
+    let sawEastbound = false;
+    let sawWestbound = false;
+    const observedKmhs: number[] = [];
+
+    for (let i = 0; i < 200; i++) {
+        sim.step(0.1);
+        for (const w of sim.getWazers()) {
+            if (w.edgeId === "101:F" || w.edgeId === "102:F") sawEastbound = true;
+            if (w.edgeId === "201:F") sawWestbound = true;
+            if (
+                (w.edgeId === "101:F" || w.edgeId === "102:F" || w.edgeId === "201:F") &&
+                w.openRoadSeconds >= 4.0
+            ) {
+                const kmh = w.speedMps * 3.6;
+                observedKmhs.push(kmh);
+                assertOk(
+                    kmh >= 125 && kmh <= 193,
+                    `Autobahn cruising speed ${kmh.toFixed(1)} km/h in expected 130-190 km/h range`
+                );
+            }
+        }
+    }
+
+    assertOk(sawEastbound, "Multi-segment Eastbound Autobahn spawns Wazers despite unreachable town streets");
+    assertOk(sawWestbound, "Single-segment 2.4km Westbound Autobahn spawns Wazers through viewport");
+    assertOk(observedKmhs.length >= 1, "Recorded unrestricted Autobahn cruising speeds");
+    const minObs = Math.min(...observedKmhs);
+    const maxObs = Math.max(...observedKmhs);
+    assertOk(maxObs > 135, `Autobahn Wazers cruise fast (max=${maxObs.toFixed(1)} km/h, min=${minObs.toFixed(1)} km/h)`);
+    console.log("PASS: Test 11 — German Autobahn variable high speed & isolated corridor spawning");
+}
+
+// 12. Dead-end roads are never detected as disconnected nodes and routes end cleanly there
+{
+    const raw = baseRaw({
+        viewportBBox: [11.999, 44.998, 12.005, 45.003],
+        segments: [
+            // Main corridor reaching west & east viewport borders (node 1 -> 2 -> 3 -> 4)
+            makeSegment(1, [[11.999, 45.0], [12.001, 45.0]], {
+                roadType: ROAD_TYPE.MINOR_HIGHWAY,
+                fromNodeId: 1,
+                toNodeId: 2,
+                length: 155,
+            }),
+            makeSegment(2, [[12.001, 45.0], [12.002, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                length: 80,
+            }),
+            makeSegment(3, [[12.002, 45.0], [12.005, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 3,
+                toNodeId: 4,
+                length: 235,
+            }),
+            // Short (~18m) two-way dead-end Street branching north from node 2
+            makeSegment(10, [[12.001, 45.0], [12.001, 45.00016]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 2,
+                toNodeId: 10,
+                length: 18,
+            }),
+            // Parallel (~6m offset) two-way dead-end Street branching off node 3 back toward node 10 (~18m away)
+            makeSegment(11, [[12.002, 45.0], [12.00118, 45.00005]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 3,
+                toNodeId: 11,
+                length: 65,
+            }),
+            // 2-segment two-way dead-end branch (node 3 -> node 12 -> node 13)
+            makeSegment(12, [[12.002, 45.0], [12.002, 44.9994]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 3,
+                toNodeId: 12,
+                length: 67,
+            }),
+            makeSegment(13, [[12.002, 44.9994], [12.002, 44.999]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 12,
+                toNodeId: 13,
+                length: 45,
+            }),
+            // Isolated unreachable street 200m north inside the viewport
+            makeSegment(99, [[12.0025, 45.0018], [12.0035, 45.0018]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 990,
+                toNodeId: 991,
+                length: 80,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 11.999, 45.0, [1]),
+            makeNode(2, 12.001, 45.0, [1, 2, 10]),
+            makeNode(3, 12.002, 45.0, [2, 3, 11, 12]),
+            makeNode(4, 12.005, 45.0, [3]),
+            makeNode(10, 12.001, 45.00016, [10]),
+            makeNode(11, 12.00118, 45.00005, [11]),
+            makeNode(12, 12.002, 44.9994, [12, 13]),
+            makeNode(13, 12.002, 44.999, [13]),
+            makeNode(990, 12.0025, 45.0018, [99]),
+            makeNode(991, 12.0035, 45.0018, [99]),
+        ],
+        streets: [
+            makeStreet(1, "Main Ave"),
+            makeStreet(2, "Main Ave"),
+            makeStreet(3, "Main Ave"),
+            makeStreet(10, "Short Cul-de-Sac"),
+            makeStreet(11, "Parallel Stub"),
+            makeStreet(12, "Dead End Branch"),
+            makeStreet(13, "Dead End Tip"),
+            makeStreet(99, "Far Island St"),
+        ],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    for (const deadEndEdgeId of ["10:F", "11:F", "13:F"]) {
+        const edge = graph.edges.get(deadEndEdgeId)!;
+        assertOk(edge, `${deadEndEdgeId} exists`);
+        assertEqual(edge.isDeadEnd, true, `${deadEndEdgeId} classified as isDeadEnd`);
+        assertEqual(edge.spawnWeight, 0, `${deadEndEdgeId} does not spawn traffic into dead end`);
+    }
+
+    for (const edgeId of ["10:F", "10:R", "11:F", "11:R", "12:F", "12:R", "13:F", "13:R"]) {
+        const hasDisconnected = (graph.outgoing.get(edgeId) ?? []).some(
+            (t) => t.bugKind === "DISCONNECTED_NODE"
+        );
+        assertEqual(hasDisconnected, false, `No false DISCONNECTED_NODE on ${edgeId}`);
+    }
+
+    // Routing to either inward (:F) or outward (:R) direction of dead-end streets ends cleanly
+    for (const targetId of ["10:F", "10:R", "11:F", "11:R", "13:F", "13:R"]) {
+        const route = findRoute(graph, "1:F", targetId, new Map());
+        assertOk(route, `Route from 1:F to ${targetId} found`);
+        assertEqual(route.terminalBug, null, `No terminal bug routing to dead-end ${targetId}`);
+        const expectedEnd = targetId.endsWith(":R") ? targetId.replace(":R", ":F") : targetId;
+        assertEqual(
+            route.routeEdgeIds[route.routeEdgeIds.length - 1],
+            expectedEnd,
+            `Route to ${targetId} ends cleanly on ${expectedEnd}`
+        );
+    }
+
+    // Routing from inside a dead-end branch toward Main Ave ends cleanly at the dead-end tip
+    for (const startId of ["12:F", "13:F"]) {
+        const trappedRoute = findRoute(graph, startId, "3:F", new Map());
+        assertOk(trappedRoute, `Route starting on dead-end branch ${startId} ends cleanly`);
+        assertEqual(trappedRoute.terminalBug, null, `No terminal bug when ending inside ${startId}`);
+        assertEqual(
+            trappedRoute.routeEdgeIds[trappedRoute.routeEdgeIds.length - 1],
+            "13:F",
+            `Route starting on ${startId} ends at dead-end terminus 13:F`
+        );
+    }
+
+    // Distant unreachable street must NOT hijack dead-end streets as DISCONNECTED_NODE
+    const farRoute = findRoute(graph, "1:F", "99:F", new Map());
+    assertEqual(farRoute, null, "Unreachable island 200m away does not trigger false dead-end/disconnected bug");
+
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, patienceSeconds: 5, maxWazers: 12 },
+        { rng: () => 0.25 }
+    );
+    sim.setGraph(graph);
+    sim.spawnSpecificWazer("1:F", "10:F");
+    sim.spawnSpecificWazer("1:F", "11:R");
+    sim.spawnSpecificWazer("1:F", "13:F");
+    for (let i = 0; i < 300; i++) {
+        sim.step(0.1);
+    }
+    assertOk(sim.getStats().arrivedCount >= 1, "Dead-end Wazers arrived cleanly");
+    assertEqual(sim.getStats().burningCount, 0, "Zero burning Wazers on healthy dead-end roads");
+    const badHotspots = sim
+        .getHotspots()
+        .filter((h) => h.kind === "DISCONNECTED_NODE" || h.kind === "DEAD_END");
+    assertEqual(badHotspots.length, 0, "Zero DISCONNECTED_NODE or DEAD_END hotspots on healthy dead ends");
+    console.log("PASS: Test 12 — Dead-end roads end routes cleanly without DISCONNECTED_NODE false positives");
+}
+
+console.log("ALL SIMWAZE TESTS PASSED");

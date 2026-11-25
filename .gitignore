@@ -1,0 +1,5 @@
+.out/
+node_modules/
+header-dev.js
+releases/*.js
+scripts/__pycache__/
