@@ -26,6 +26,12 @@ npm run build      # Development bundle -> releases/release-<version>.user.js
 npm run release    # Minified production bundle
 ```
 
+## Disclaimer
+
+**SimWaze** is an independent, community-developed userscript and is **not** affiliated with, provided by, endorsed by, sponsored by, or supported in any way by **Waze Mobile Ltd.** or **Google LLC**. "Waze", the Waze logo, Waze mood icons, and related marks and assets are trademarks or copyrighted property of Waze Mobile Ltd. All rights belong to their respective owners and are reserved.
+
+This script is provided **"as is"**, without warranty of any kind, express or implied. Users use it at their own risk and remain solely responsible for verifying all map edits and for any errors or issues caused to the map that may occur while using it.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
