@@ -13,8 +13,8 @@ Turn the Waze Map Editor (WME) into a living, breathing, top-down traffic simula
 ## Installation Instructions
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) (or another userscript manager).
-2. Install **SimWaze** from the latest release (`releases/release-<version>.user.js`).
-3. Open the Waze Map Editor at zoom level **12+** and open the **SimWaze** tab in the Scripts sidebar (or press `Alt + Shift + S` to toggle simulation).
+2. Install **SimWaze** [latest release](https://github.com/bedo2991/wme-simwaze/releases/latest/download/release.user.js).
+3. Open the Waze Map Editor at zoom level **16+** and open the **SimWaze** tab in the Scripts sidebar (or press `Alt + Shift + S` to toggle simulation).
 
 ## Development
 
