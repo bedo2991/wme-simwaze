@@ -4,6 +4,7 @@ import type {
     Segment,
     Street,
     Turn,
+    TurnClosure,
     Node as WmeNode,
 } from "wme-sdk-typings";
 import { buildRoadGraphFromRawData, RawGraphInput } from "../src/graph";
@@ -1813,6 +1814,147 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
     );
 
     console.log("PASS: Test 15 — Custom past & future timestamp evaluation for restrictions and closures");
+}
+
+// ============================================================================
+// Test 16: Turn closure on roundabout segments does not close the segments themselves
+// ============================================================================
+{
+    const activeTurnClosure: TurnClosure = {
+        id: "tc-rb-1",
+        fromSegmentId: 10,
+        toSegmentId: 11,
+        description: "Closed roundabout continuation turn",
+        startDate: "2026-06-01 08:00",
+        endDate: "2026-06-01 20:00",
+        isPermanent: true,
+        majorTrafficEventId: null,
+        status: "ACTIVE",
+        modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+    };
+
+    const makeRbRaw = (evalTimestamp: string | null) =>
+        baseRaw({
+            viewportBBox: [11.999, 44.999, 12.005, 45.005],
+            evalTimestamp,
+            nowMs: new Date(2026, 5, 1, 12, 0, 0).getTime(),
+            segments: [
+                // West approach/exit (border at west)
+                makeSegment(1, [[11.999, 45.002], [12.001, 45.002]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                }),
+                // South-East approach/exit (border at south)
+                makeSegment(2, [[12.002, 45.001], [12.003, 44.999]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 3,
+                    toNodeId: 5,
+                }),
+                // North-East approach/exit (border at east)
+                makeSegment(3, [[12.003, 45.003], [12.005, 45.004]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 4,
+                    toNodeId: 6,
+                }),
+                // Roundabout SW ring segment (W -> SE): hasClosures=true due to TurnClosure
+                makeSegment(10, [[12.001, 45.002], [12.0014, 45.0012], [12.002, 45.001]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    junctionId: 900,
+                    isTwoWay: false,
+                    isAtoB: true,
+                    isBtoA: false,
+                    hasClosures: true,
+                }),
+                // Roundabout E ring segment (SE -> NE): hasClosures=true due to TurnClosure
+                makeSegment(11, [[12.002, 45.001], [12.003, 45.0019], [12.003, 45.003]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 3,
+                    toNodeId: 4,
+                    junctionId: 900,
+                    isTwoWay: false,
+                    isAtoB: true,
+                    isBtoA: false,
+                    hasClosures: true,
+                }),
+                // Roundabout N ring segment (NE -> W)
+                makeSegment(12, [[12.003, 45.003], [12.002, 45.0032], [12.001, 45.002]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 4,
+                    toNodeId: 2,
+                    junctionId: 900,
+                    isTwoWay: false,
+                    isAtoB: true,
+                    isBtoA: false,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 11.999, 45.002, [1]),
+                makeNode(2, 12.001, 45.002, [1, 10, 12]),
+                makeNode(3, 12.002, 45.001, [10, 11, 2]),
+                makeNode(4, 12.003, 45.003, [11, 12, 3]),
+                makeNode(5, 12.003, 44.999, [2]),
+                makeNode(6, 12.005, 45.004, [3]),
+            ],
+            turnClosures: [activeTurnClosure],
+            streets: [
+                makeStreet(1, "West Ave"),
+                makeStreet(2, "South-East Rd"),
+                makeStreet(3, "North-East Rd"),
+            ],
+        });
+
+    const liveGraph = buildRoadGraphFromRawData(makeRbRaw(null));
+    assertEqual(
+        liveGraph.edges.get("10:F")!.isClosed,
+        false,
+        "Roundabout seg 10 stays open when only a turn closure references it"
+    );
+    assertEqual(
+        liveGraph.edges.get("11:F")!.isClosed,
+        false,
+        "Roundabout seg 11 stays open when only a turn closure references it"
+    );
+
+    const westToSe = findRoute(liveGraph, "1:F", "2:F", new Map());
+    assertOk(westToSe, "Wazer can still route through seg 10 to exit South-East");
+    assertEqual(westToSe.terminalBug, null, "No road-closure bug when exiting South-East");
+    assertEqual(
+        westToSe.routeEdgeIds.join(","),
+        "1:F,10:F,2:F",
+        "Route uses seg 10 and exits at South-East"
+    );
+
+    const seToNe = findRoute(liveGraph, "2:R", "3:F", new Map());
+    assertOk(seToNe, "Wazer entering from South-East can still route through seg 11 to North-East");
+    assertEqual(seToNe.terminalBug, null, "No road-closure bug when entering onto seg 11");
+    assertEqual(
+        seToNe.routeEdgeIds.join(","),
+        "2:R,11:F,3:F",
+        "Route enters seg 11 and exits at North-East"
+    );
+
+    const westToNeBlocked = findRoute(liveGraph, "1:F", "3:F", new Map());
+    assertEqual(
+        westToNeBlocked,
+        null,
+        "Closed turn 10->11 blocks West->North-East without jamming since other legal exits exist"
+    );
+
+    // Outside the turn closure window, the full roundabout continuation works legally
+    const afterGraph = buildRoadGraphFromRawData(makeRbRaw("2026-06-01T21:00"));
+    const westToNeOpen = findRoute(afterGraph, "1:F", "3:F", new Map());
+    assertOk(westToNeOpen, "West->North-East routes legally after turn closure ends");
+    assertEqual(westToNeOpen.terminalBug, null, "No terminal bug after turn closure ends");
+    assertEqual(
+        westToNeOpen.routeEdgeIds.join(","),
+        "1:F,10:F,11:F,3:F",
+        "Route continues through 10:F -> 11:F after turn closure ends"
+    );
+
+    console.log("PASS: Test 16 — Turn closure blocks only the closed turn, keeping participating segments drivable");
 }
 
 console.log("ALL SIMWAZE TESTS PASSED");

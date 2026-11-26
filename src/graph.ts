@@ -574,6 +574,10 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
     // Index active turn closures by "fromSegId->toSegId" for the selected timestamp
     const closedTurns = new Set<string>();
     for (const tc of raw.turnClosures) {
+        // Turn closures set seg.hasClosures = true on both participating segments;
+        // track them so the fallback does not falsely mark either segment as a closed road.
+        segmentsWithClosureRecords.add(tc.fromSegmentId);
+        segmentsWithClosureRecords.add(tc.toSegmentId);
         if (!isClosureActiveAt(tc, evalDt)) continue;
         closedTurns.add(`${tc.fromSegmentId}->${tc.toSegmentId}`);
     }
