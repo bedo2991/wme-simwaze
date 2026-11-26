@@ -95,6 +95,25 @@ function computeUnrestrictedFreewaySpeedKmh(segId: number, isForward: boolean): 
     return 130 + (hash % 61); // 130..190 km/h
 }
 
+async function safeSdkArray<T>(fn: () => Promise<T[]> | T[], label: string): Promise<T[]> {
+    try {
+        const res = await fn();
+        return Array.isArray(res) ? res : [];
+    } catch (err) {
+        console.debug(`SimWaze: ${label} threw, falling back to []:`, err);
+        return [];
+    }
+}
+
+async function safeSdkValue<T>(fn: () => Promise<T> | T, fallback: T, label: string): Promise<T> {
+    try {
+        return await fn();
+    } catch (err) {
+        console.debug(`SimWaze: ${label} threw, using fallback:`, err);
+        return fallback;
+    }
+}
+
 export async function fetchRawGraphData(
     wmeSDK: AsyncWmeSDK,
     evalTimestamp: string | null = null
@@ -113,14 +132,14 @@ export async function fetchRawGraphData(
     ] = await Promise.all([
         wmeSDK.DataModel.Segments.getAll(),
         wmeSDK.DataModel.Nodes.getAll(),
-        wmeSDK.DataModel.Turns.getAll(),
-        wmeSDK.DataModel.RoadClosures.getAll(),
-        wmeSDK.DataModel.TurnClosures.getAll(),
-        wmeSDK.DataModel.Streets.getAll(),
-        wmeSDK.DataModel.Countries.getTopCountry(),
-        wmeSDK.Settings.getUserSettings(),
-        wmeSDK.Map.getMapExtent().catch(() => null),
-        wmeSDK.DataModel.PermanentHazards.getAll().catch(() => [] as PermanentHazard[]),
+        safeSdkArray(() => wmeSDK.DataModel.Turns.getAll(), "Turns.getAll"),
+        safeSdkArray(() => wmeSDK.DataModel.RoadClosures.getAll(), "RoadClosures.getAll"),
+        safeSdkArray(() => wmeSDK.DataModel.TurnClosures.getAll(), "TurnClosures.getAll"),
+        safeSdkArray(() => wmeSDK.DataModel.Streets.getAll(), "Streets.getAll"),
+        safeSdkValue(() => wmeSDK.DataModel.Countries.getTopCountry(), null, "Countries.getTopCountry"),
+        safeSdkValue(() => wmeSDK.Settings.getUserSettings(), null, "Settings.getUserSettings"),
+        safeSdkValue(() => wmeSDK.Map.getMapExtent(), null, "Map.getMapExtent"),
+        safeSdkArray(() => wmeSDK.DataModel.PermanentHazards.getAll(), "PermanentHazards.getAll"),
     ]);
 
     const turnLookup = new Set<string>();

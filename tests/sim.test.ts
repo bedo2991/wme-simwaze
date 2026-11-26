@@ -9,7 +9,7 @@ import type {
     Node as WmeNode,
 } from "wme-sdk-typings";
 import { distanceMeters, sampleEdgePosition, WebMercatorProjector } from "../src/geo";
-import { buildRoadGraphFromRawData, RawGraphInput } from "../src/graph";
+import { buildRoadGraphFromRawData, buildRoadGraphFromSDK, RawGraphInput } from "../src/graph";
 import { WME_ROAD_TYPE as ROAD_TYPE } from "../src/roadProfiles";
 import { findRoute, hasEnabledOutgoingTurn } from "../src/router";
 import { ScreensaverController } from "../src/screensaver";
@@ -2271,6 +2271,98 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         console.log(
             `PASS: Test 19 — Smooth junction arcs (maxStep=${maxStepJumpMeters.toFixed(3)}m, maxTurnStep=${((maxHeadingDeltaRad * 180) / Math.PI).toFixed(1)}°)`
         );
+    }
+
+    // ========================================================================
+    // Test 20: Resilient SDK graph build when WME RoadClosures.getAll() throws synchronously
+    // ========================================================================
+    {
+        const segOpen = makeSegment(1, [[12.0, 45.0], [12.002, 45.0]], {
+            roadType: ROAD_TYPE.PRIMARY_STREET,
+            fromNodeId: 1,
+            toNodeId: 2,
+        });
+        const segRoadClosed = makeSegment(2, [[12.002, 45.0], [12.004, 45.0]], {
+            roadType: ROAD_TYPE.STREET,
+            fromNodeId: 2,
+            toNodeId: 3,
+            hasClosures: true,
+        });
+        const segTurnClosed = makeSegment(3, [[12.002, 45.0], [12.002, 45.002]], {
+            roadType: ROAD_TYPE.STREET,
+            fromNodeId: 2,
+            toNodeId: 4,
+            hasClosures: true,
+        });
+
+        const buggyWmeSdk = {
+            DataModel: {
+                Segments: { getAll: async () => [segOpen, segRoadClosed, segTurnClosed] },
+                Nodes: {
+                    getAll: async () => [
+                        makeNode(1, 12.0, 45.0, [1]),
+                        makeNode(2, 12.002, 45.0, [1, 2, 3]),
+                        makeNode(3, 12.004, 45.0, [2]),
+                        makeNode(4, 12.002, 45.002, [3]),
+                    ],
+                },
+                Turns: {
+                    getAll: async () => [
+                        makeTurn(1, true, 2, true, true),
+                        makeTurn(1, true, 3, true, true),
+                    ],
+                    isTurnAllowed: async () => true,
+                },
+                RoadClosures: {
+                    // Simulate WME SDK Proxy synchronous throw inside RoadClosures.getAll()
+                    getAll: (): Promise<RoadClosure[]> => {
+                        const nullArr = null as unknown as number[];
+                        nullArr.map((x) => x);
+                        return Promise.resolve([]);
+                    },
+                },
+                TurnClosures: {
+                    getAll: async (): Promise<TurnClosure[]> => [
+                        {
+                            id: "tc-1",
+                            fromSegmentId: 1,
+                            toSegmentId: 3,
+                            description: "Closed left turn",
+                            startDate: null,
+                            endDate: null,
+                            isPermanent: true,
+                            majorTrafficEventId: null,
+                            status: "ACTIVE",
+                            modificationData: {
+                                createdBy: null,
+                                createdOn: null,
+                                updatedBy: null,
+                                updatedOn: null,
+                            },
+                        },
+                    ],
+                },
+                Streets: { getAll: async () => [makeStreet(1, "Main"), makeStreet(3, "Side")] },
+                Countries: { getTopCountry: async () => ({ isLeftHandTraffic: false }) },
+                PermanentHazards: { getAll: async () => [] },
+            },
+            Settings: { getUserSettings: async () => ({ isImperial: false }) },
+            Map: { getMapExtent: async () => [11.999, 44.999, 12.005, 45.003] },
+        } as unknown as AsyncWmeSDK;
+
+        const graph = await buildRoadGraphFromSDK(buggyWmeSdk, null);
+        assertOk(graph.edgeList.length > 0, "Graph built successfully despite RoadClosures.getAll() crash");
+        assertEqual(
+            graph.edges.get("2:F")!.isClosed,
+            true,
+            "Segment with hasClosures=true and no TurnClosure falls back to closed"
+        );
+        assertEqual(
+            graph.edges.get("3:F")!.isClosed,
+            false,
+            "Segment referenced by TurnClosure stays open even when RoadClosures.getAll() threw"
+        );
+        console.log("PASS: Test 20 — Resilient SDK graph build when RoadClosures.getAll() throws");
     }
 
     console.log("ALL SIMWAZE TESTS PASSED");
