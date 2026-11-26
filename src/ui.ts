@@ -1,6 +1,7 @@
 import { AsyncWmeSDK } from "wme-sdk-typings";
 import { describeBugKind } from "./graph";
 import { ROAD_LEGEND_ITEMS } from "./roadProfiles";
+import { formatLocalDateTimeInputValue } from "./timeEval";
 import { ChaosHotspot, MIN_SIM_ZOOM, SimSettings, SimStats } from "./types";
 
 export interface SimUICallbacks {
@@ -24,6 +25,9 @@ export class SimSidebarUI {
     private pauseBtn: HTMLButtonElement | null = null;
     private soundToggle: HTMLInputElement | null = null;
     private zoomWarningEl: HTMLDivElement | null = null;
+    private evalDateTimeInput: HTMLInputElement | null = null;
+    private evalStatusEl: HTMLElement | null = null;
+    private evalClearBtn: HTMLButtonElement | null = null;
 
     private statActiveEl: HTMLElement | null = null;
     private statJamEl: HTMLElement | null = null;
@@ -255,6 +259,70 @@ export class SimSidebarUI {
             this.settings.showBugBadges = checked;
             this.emitChange();
         });
+
+        this.evalDateTimeInput = root.querySelector<HTMLInputElement>("#wme-sim-eval-datetime");
+        this.evalStatusEl = root.querySelector<HTMLElement>("#wme-sim-eval-status");
+        this.evalClearBtn = root.querySelector<HTMLButtonElement>("#wme-sim-eval-clear-btn");
+
+        const syncEvalStatusUI = () => {
+            const isCustom = Boolean(this.settings.evalTimestamp);
+            if (this.evalStatusEl) {
+                this.evalStatusEl.textContent = isCustom ? "Custom" : "Live";
+                this.evalStatusEl.classList.toggle("is-custom", isCustom);
+            }
+            if (this.evalClearBtn) {
+                this.evalClearBtn.disabled = !isCustom;
+            }
+        };
+
+        if (this.evalDateTimeInput) {
+            this.evalDateTimeInput.value = this.settings.evalTimestamp ?? "";
+            syncEvalStatusUI();
+
+            this.evalDateTimeInput.addEventListener("input", () => {
+                this.evalDateTimeInput?.setCustomValidity("");
+            });
+
+            this.evalDateTimeInput.addEventListener("change", () => {
+                if (!this.evalDateTimeInput) return;
+                const val = this.evalDateTimeInput.value.trim();
+                if (!val) {
+                    this.settings.evalTimestamp = null;
+                    syncEvalStatusUI();
+                    this.emitChange();
+                } else if (this.evalDateTimeInput.validity.valid) {
+                    this.settings.evalTimestamp = val;
+                    syncEvalStatusUI();
+                    this.emitChange();
+                }
+            });
+        } else {
+            syncEvalStatusUI();
+        }
+
+        root.querySelector<HTMLButtonElement>("#wme-sim-eval-now-btn")?.addEventListener(
+            "click",
+            () => {
+                const val = formatLocalDateTimeInputValue();
+                this.settings.evalTimestamp = val;
+                if (this.evalDateTimeInput) {
+                    this.evalDateTimeInput.value = val;
+                    this.evalDateTimeInput.setCustomValidity("");
+                }
+                syncEvalStatusUI();
+                this.emitChange();
+            }
+        );
+
+        this.evalClearBtn?.addEventListener("click", () => {
+            this.settings.evalTimestamp = null;
+            if (this.evalDateTimeInput) {
+                this.evalDateTimeInput.value = "";
+                this.evalDateTimeInput.setCustomValidity("");
+            }
+            syncEvalStatusUI();
+            this.emitChange();
+        });
     }
 
     private bindCheckbox(
@@ -398,6 +466,27 @@ export class SimSidebarUI {
                         <span id="wme-sim-patience-val" class="wme-sim-val">10s</span>
                     </div>
                     <input type="range" id="wme-sim-patience" class="wme-sim-slider" min="5" max="25" step="1" value="10">
+                </div>
+
+                <div class="wme-sim-datetime-field">
+                    <div class="wme-sim-slider-head">
+                        <label for="wme-sim-eval-datetime">Restriction &amp; Closure Time</label>
+                        <span id="wme-sim-eval-status" class="wme-sim-mode-pill">Live</span>
+                    </div>
+                    <input
+                        type="datetime-local"
+                        id="wme-sim-eval-datetime"
+                        name="evalDatetime"
+                        class="wme-sim-datetime"
+                        aria-describedby="wme-sim-eval-help"
+                    >
+                    <div class="wme-sim-datetime-actions">
+                        <span id="wme-sim-eval-help" class="wme-sim-field-hint">Past or future; empty = live.</span>
+                        <div class="wme-sim-btn-group">
+                            <button type="button" id="wme-sim-eval-now-btn" class="wme-sim-btn wme-sim-btn-sm" title="Set to current date and time">Now</button>
+                            <button type="button" id="wme-sim-eval-clear-btn" class="wme-sim-btn wme-sim-btn-sm" title="Reset to live clock">Reset</button>
+                        </div>
+                    </div>
                 </div>
             </section>
 
@@ -886,6 +975,58 @@ export class SimSidebarUI {
                 font-size: 11px;
                 color: var(--content_p2, #5f6368);
                 font-variant-numeric: tabular-nums;
+            }
+            .wme-sim-datetime-field {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding-block-start: 6px;
+                border-block-start: 1px solid var(--hairline, rgba(128, 128, 128, 0.2));
+            }
+            .wme-sim-datetime {
+                inline-size: 100%;
+                box-sizing: border-box;
+                min-block-size: 38px;
+                padding: 5px 8px;
+                font: inherit;
+                font-size: 12px;
+                border-radius: 6px;
+                border: 1px solid var(--content_p2, #5f6368);
+                background: var(--background_default, #ffffff);
+                color: var(--content_default, #202124);
+            }
+            .wme-sim-datetime:focus-visible {
+                outline: 2px solid #1a73e8;
+                outline-offset: 2px;
+            }
+            .wme-sim-datetime:user-invalid {
+                border-color: #dc2626;
+            }
+            .wme-sim-datetime-actions {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 6px;
+            }
+            .wme-sim-field-hint {
+                font-size: 11px;
+                color: var(--content_p2, #5f6368);
+            }
+            .wme-sim-mode-pill {
+                font-size: 10px;
+                font-weight: 600;
+                padding: 1px 6px;
+                border-radius: 999px;
+                background: rgba(128, 128, 128, 0.16);
+                color: var(--content_p2, #5f6368);
+            }
+            .wme-sim-mode-pill.is-custom {
+                background: rgba(26, 115, 232, 0.16);
+                color: #1a73e8;
+            }
+            .wme-sim-btn-sm {
+                padding: 3px 8px;
+                font-size: 11px;
             }
         `;
         document.head.appendChild(style);

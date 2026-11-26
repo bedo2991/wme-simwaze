@@ -89,6 +89,7 @@ function edgeTravelCost(edge: DirectedEdge, occupancy: Map<string, number>): num
     return (
         (edge.lengthMeters / Math.max(edge.speedMps, 2)) *
         importanceFactor *
+        (edge.restrictionPenaltyFactor ?? 1) *
         congestionMultiplier
     );
 }
@@ -303,6 +304,14 @@ export function findRoute(
                 // A segment with an enabled legal outgoing turn is NOT a dead end
                 if (trans.bugKind === "DEAD_END" && hasEnabledOutgoingTurn(graph, fromEdge.id)) {
                     continue;
+                }
+                // If an unrestricted continuing alternative exists at this junction, do not jam here
+                if (
+                    trans.bugKind !== "DISCONNECTED_NODE" &&
+                    hasEnabledOutgoingTurn(graph, fromEdge.id) &&
+                    graph.canExitCorridorIds.has(fromEdge.id)
+                ) {
+                    return null;
                 }
                 return {
                     routeEdgeIds: fullPath.slice(0, i),

@@ -1473,4 +1473,346 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
     console.log("PASS: Test 13 — Street-only spawning & road importance routing priority");
 }
 
+// 14. 3 connected segments with 1 restricted segment: Wazers take unrestricted branch instead of getting stuck
+{
+    const makeRestriction = (
+        overrides: Partial<Segment["restrictions"][number]> = {}
+    ): Segment["restrictions"][number] => ({
+        defaultType: "BLOCKED",
+        description: "Test restriction",
+        direction: "BOTH",
+        disposition: "WHOLE_SEGMENT",
+        driveProfiles: {},
+        editable: true,
+        isExpired: false,
+        laneScope: "WHOLE_SEGMENT",
+        laneType: null,
+        timeFrames: [],
+        vehicleRules: {},
+        ...overrides,
+    });
+
+    const buildThreeBranchRaw = (restrictSeg2: boolean) =>
+        baseRaw({
+            viewportBBox: [11.999, 44.998, 12.005, 45.002],
+            segments: [
+                // Seg 1: Entry road (node 1 -> node 2)
+                makeSegment(1, [[11.999, 45.0], [12.001, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                    length: 155,
+                }),
+                // Seg 2: Branch 1 (node 2 -> node 3) - forward direction blocked, reverse open
+                makeSegment(2, [[12.001, 45.0], [12.0025, 45.001]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    length: 155,
+                    hasRestrictions: restrictSeg2,
+                    restrictions: restrictSeg2
+                        ? [
+                              makeRestriction({
+                                  direction: "FWD",
+                                  defaultType: "FREE",
+                                  vehicleRules: {
+                                      BLOCKED: [
+                                          {
+                                              licensePlateNumber: null,
+                                              licensePlateRule: null,
+                                              minPassengers: 0,
+                                              numPassengers: 0,
+                                              subscriptions: [],
+                                              vehicleTypes: ["PRIVATE"],
+                                          },
+                                      ],
+                                  },
+                              }),
+                          ]
+                        : [],
+                }),
+                // Seg 4: Downstream street behind Seg 2 (node 3 -> node 5)
+                makeSegment(4, [[12.0025, 45.001], [12.004, 45.001]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 3,
+                    toNodeId: 5,
+                    length: 120,
+                }),
+                // Seg 3: Unrestricted alternative branch reaching east border (node 2 -> node 4)
+                makeSegment(3, [[12.001, 45.0], [12.005, 44.9995]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 2,
+                    toNodeId: 4,
+                    length: 320,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 11.999, 45.0, [1]),
+                makeNode(2, 12.001, 45.0, [1, 2, 3]),
+                makeNode(3, 12.0025, 45.001, [2, 4]),
+                makeNode(4, 12.005, 44.9995, [3]),
+                makeNode(5, 12.004, 45.001, [4]),
+            ],
+            streets: [
+                makeStreet(1, "Entry Blvd"),
+                makeStreet(2, "Restricted Way"),
+                makeStreet(3, "Open Alternate St"),
+                makeStreet(4, "Behind Restriction St"),
+            ],
+        });
+
+    const restrictedGraph = buildRoadGraphFromRawData(buildThreeBranchRaw(true));
+    assertEqual(restrictedGraph.edges.get("2:F")!.isClosed, true, "Seg 2 forward blocked by restriction");
+    assertEqual(restrictedGraph.edges.get("2:R")!.isClosed, false, "Seg 2 reverse remains open");
+    assertEqual(restrictedGraph.edges.get("3:F")!.isClosed, false, "Seg 3 unrestricted alternate open");
+
+    // Routing toward the unreachable restricted branch or behind it must NOT trap Wazers at node 2
+    assertEqual(
+        findRoute(restrictedGraph, "1:F", "2:R", new Map()),
+        null,
+        "Routing from Seg 1 to 2:R returns null instead of jamming at node 2"
+    );
+    assertEqual(
+        findRoute(restrictedGraph, "1:F", "4:F", new Map()),
+        null,
+        "Routing from Seg 1 to 4:F returns null instead of jamming at node 2"
+    );
+
+    const openRoute = findRoute(restrictedGraph, "1:F", "3:F", new Map());
+    assertOk(openRoute, "Route onto unrestricted Seg 3 found");
+    assertEqual(openRoute.terminalBug, null, "No terminal bug on unrestricted Seg 3 route");
+    assertDeepEqual(openRoute.routeEdgeIds, ["1:F", "3:F"], "Wazer takes unrestricted Seg 3");
+
+    // Simulate spawning & live restriction activation
+    const sim = new TrafficSimulator(
+        { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, patienceSeconds: 5, maxWazers: 8 },
+        { rng: () => 0.35 }
+    );
+    const openGraph = buildRoadGraphFromRawData(buildThreeBranchRaw(false));
+    sim.setGraph(openGraph);
+    const w = sim.spawnSpecificWazer("1:F", "4:F");
+    assertOk(w, "Wazer spawned heading toward Seg 4 while Seg 2 is open");
+    sim.step(0.5);
+
+    // Editor adds restriction on Seg 2 while Wazer is still on Seg 1 -> reroutes onto Seg 3
+    sim.setGraph(restrictedGraph);
+    assertOk(sim.getWazers().length === 1, "Wazer survived graph rebuild after restriction added");
+    assertEqual(sim.getWazers()[0].terminalBug, null, "Rerouted Wazer has no terminal bug");
+    assertEqual(
+        sim.getWazers()[0].routeEdgeIds[sim.getWazers()[0].routeEdgeIds.length - 1],
+        "3:F",
+        "Wazer rerouted onto unrestricted Seg 3"
+    );
+
+    for (let i = 0; i < 450; i++) {
+        sim.step(0.1);
+    }
+    assertOk(sim.getStats().arrivedCount >= 1, "Wazers arrived via unrestricted branch");
+    assertEqual(sim.getStats().burningCount, 0, "Zero burning Wazers when unrestricted branch exists");
+    assertEqual(sim.getHotspots().length, 0, "Zero chaos hotspots when unrestricted branch exists");
+    console.log("PASS: Test 14 — Multi-branch restricted segment routes cleanly via unrestricted segment");
+}
+
+// 15. Custom date & time evaluation (past & future) for restrictions and road/turn closures
+{
+    const makeTimeFramedRestriction = (
+        timeFrames: Segment["restrictions"][number]["timeFrames"],
+        overrides: Partial<Segment["restrictions"][number]> = {}
+    ): Segment["restrictions"][number] => ({
+        defaultType: "BLOCKED",
+        description: "Timed restriction",
+        direction: "FWD",
+        disposition: "WHOLE_SEGMENT",
+        driveProfiles: {},
+        editable: true,
+        isExpired: true, // Expired relative to current year, but active in 2024
+        laneScope: "WHOLE_SEGMENT",
+        laneType: null,
+        timeFrames,
+        vehicleRules: {},
+        ...overrides,
+    });
+
+    const timedRaw = (evalTimestamp: string | null): RawGraphInput =>
+        baseRaw({
+            evalTimestamp,
+            segments: [
+                makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                }),
+                makeSegment(2, [[12.001, 45.0], [12.002, 45.0]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    hasRestrictions: true,
+                    restrictions: [
+                        makeTimeFramedRestriction([
+                            {
+                                startDate: "2024-05-01",
+                                endDate: "2024-05-31",
+                                fromTime: "08:00",
+                                toTime: "10:00",
+                                weekdays: ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"],
+                                dayAlternation: null,
+                                daysOfMonth: null,
+                                repeatYearly: false,
+                                timeZone: null,
+                            },
+                        ]),
+                    ],
+                }),
+                makeSegment(3, [[12.001, 45.0], [12.002, 44.999]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 2,
+                    toNodeId: 4,
+                    hasRestrictions: true,
+                    restrictions: [
+                        makeTimeFramedRestriction(
+                            [
+                                {
+                                    startDate: null,
+                                    endDate: null,
+                                    fromTime: "22:00",
+                                    toTime: "03:00",
+                                    weekdays: ["FRIDAY"],
+                                    dayAlternation: null,
+                                    daysOfMonth: null,
+                                    repeatYearly: false,
+                                    timeZone: null,
+                                },
+                            ],
+                            { isExpired: false }
+                        ),
+                    ],
+                }),
+                // Past finished closure (2023-08-10 09:00..17:00)
+                makeSegment(4, [[12.002, 45.0], [12.003, 45.0]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 3,
+                    toNodeId: 5,
+                    hasClosures: true,
+                }),
+                // Future scheduled closure (2027-02-01 06:00..18:00)
+                makeSegment(5, [[12.002, 44.999], [12.003, 44.999]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 4,
+                    toNodeId: 6,
+                    hasClosures: false,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0, 45.0, [1]),
+                makeNode(2, 12.001, 45.0, [1, 2, 3]),
+                makeNode(3, 12.002, 45.0, [2, 4]),
+                makeNode(4, 12.002, 44.999, [3, 5]),
+                makeNode(5, 12.003, 45.0, [4]),
+                makeNode(6, 12.003, 44.999, [5]),
+            ],
+            roadClosures: [
+                {
+                    id: "rc-past",
+                    segmentId: 4,
+                    isForward: true,
+                    isPermanent: true,
+                    status: "FINISHED",
+                    description: "Past paving",
+                    startDate: "2023-08-10 09:00",
+                    endDate: "2023-08-10 17:00",
+                    trafficEventId: null,
+                    attributions: [],
+                    modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+                },
+                {
+                    id: "rc-future",
+                    segmentId: 5,
+                    isForward: true,
+                    isPermanent: true,
+                    status: "NOT_STARTED",
+                    description: "Future marathon",
+                    startDate: "2027-02-01 06:00",
+                    endDate: "2027-02-01 18:00",
+                    trafficEventId: null,
+                    attributions: [],
+                    modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+                },
+            ],
+            streets: [
+                makeStreet(1, "Base Rd"),
+                makeStreet(2, "Morning Restricted St"),
+                makeStreet(3, "Overnight Restricted St"),
+                makeStreet(4, "Past Closed St"),
+                makeStreet(5, "Future Closed St"),
+            ],
+        });
+
+    // Past Monday 08:30 inside May 2024 weekday morning window -> blocked
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2024-05-13T08:30")).edges.get("2:F")!.isClosed,
+        true,
+        "Seg 2 blocked at past Monday 2024-05-13 08:30"
+    );
+    // Past Monday 11:30 outside 08:00-10:00 window -> open
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2024-05-13T11:30")).edges.get("2:F")!.isClosed,
+        false,
+        "Seg 2 open at past Monday 2024-05-13 11:30"
+    );
+    // Past Sunday 08:30 (not Mon-Fri) -> open
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2024-05-12T08:30")).edges.get("2:F")!.isClosed,
+        false,
+        "Seg 2 open at past Sunday 2024-05-12 08:30"
+    );
+
+    // Overnight Friday 22:00..03:00 window
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2026-05-15T23:00")).edges.get("3:F")!.isClosed,
+        true,
+        "Seg 3 blocked on Friday 23:00"
+    );
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2026-05-16T01:30")).edges.get("3:F")!.isClosed,
+        true,
+        "Seg 3 still blocked on Saturday 01:30 (overnight from Friday)"
+    );
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2026-05-16T12:00")).edges.get("3:F")!.isClosed,
+        false,
+        "Seg 3 open on Saturday 12:00"
+    );
+
+    // Past FINISHED closure active during its 2023 window, open outside & in live mode
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2023-08-10T12:00")).edges.get("4:F")!.isClosed,
+        true,
+        "Past FINISHED road closure is closed during its 2023-08-10 window"
+    );
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2023-08-10T18:00")).edges.get("4:F")!.isClosed,
+        false,
+        "Past FINISHED road closure is open after its window"
+    );
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw(null)).edges.get("4:F")!.isClosed,
+        false,
+        "Past FINISHED road closure is open in live mode despite seg.hasClosures=true"
+    );
+
+    // Future NOT_STARTED closure active during its 2027 window, open in live mode
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw("2027-02-01T10:00")).edges.get("5:F")!.isClosed,
+        true,
+        "Future NOT_STARTED road closure is closed during its 2027-02-01 window"
+    );
+    assertEqual(
+        buildRoadGraphFromRawData(timedRaw(null)).edges.get("5:F")!.isClosed,
+        false,
+        "Future NOT_STARTED road closure is open in live mode"
+    );
+
+    console.log("PASS: Test 15 — Custom past & future timestamp evaluation for restrictions and closures");
+}
+
 console.log("ALL SIMWAZE TESTS PASSED");

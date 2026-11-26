@@ -185,21 +185,57 @@ export class TrafficSimulator {
             w.distOnEdge = Math.min(w.distOnEdge, Math.max(0, edge.lengthMeters - STOP_LINE_METERS));
             w.laneIndex = Math.min(w.laneIndex, edge.lanes - 1);
 
-            let destEdge = newGraph.edges.get(w.destEdgeId);
-            if (!destEdge || destEdge.isClosed) {
-                const replacementId = pickWeightedEdgeId(
-                    newGraph.destEdgeIds,
-                    newGraph.destCumulativeWeights,
-                    this.rng
-                );
-                if (!replacementId) continue;
-                w.destEdgeId = replacementId;
-                destEdge = newGraph.edges.get(replacementId);
-                if (!destEdge) continue;
-                w.destStreetName = destEdge.streetName;
+            const destEdge = newGraph.edges.get(w.destEdgeId);
+            let newRoute =
+                destEdge && !destEdge.isClosed
+                    ? findRoute(newGraph, w.edgeId, w.destEdgeId, this.edgeOccupancy)
+                    : null;
+
+            if (!newRoute) {
+                for (let dTry = 0; dTry < 6; dTry++) {
+                    const replacementId = pickWeightedEdgeId(
+                        newGraph.destEdgeIds,
+                        newGraph.destCumulativeWeights,
+                        this.rng
+                    );
+                    if (!replacementId) continue;
+                    const candDest = newGraph.edges.get(replacementId);
+                    if (!candDest || candDest.isClosed || candDest.segmentId === edge.segmentId) {
+                        continue;
+                    }
+                    const candRoute = findRoute(
+                        newGraph,
+                        w.edgeId,
+                        replacementId,
+                        this.edgeOccupancy
+                    );
+                    if (candRoute) {
+                        w.destEdgeId = replacementId;
+                        w.destStreetName = candDest.streetName;
+                        newRoute = candRoute;
+                        break;
+                    }
+                }
             }
 
-            const newRoute = findRoute(newGraph, w.edgeId, w.destEdgeId, this.edgeOccupancy);
+            if (!newRoute) {
+                const fallbackDestId = this.findCorridorFallbackDestId(edge);
+                if (fallbackDestId) {
+                    const fallbackDest = newGraph.edges.get(fallbackDestId);
+                    const fallbackRoute = findRoute(
+                        newGraph,
+                        w.edgeId,
+                        fallbackDestId,
+                        this.edgeOccupancy
+                    );
+                    if (fallbackDest && fallbackRoute) {
+                        w.destEdgeId = fallbackDestId;
+                        w.destStreetName = fallbackDest.streetName;
+                        newRoute = fallbackRoute;
+                    }
+                }
+            }
+
             if (!newRoute) continue;
 
             const wasStuckOnBug = w.terminalBug !== null;

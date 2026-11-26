@@ -76,6 +76,7 @@ async function initScript(): Promise<void> {
 
     const ui = new SimSidebarUI(wmeSDK, settings, {
         onSettingsChange: (next) => {
+            const prevEvalTimestamp = settings.evalTimestamp;
             Object.assign(settings, next);
             saveSettings(settings);
             audio.setEnabled(settings.soundEnabled);
@@ -83,6 +84,8 @@ async function initScript(): Promise<void> {
             simulator.updateSettings(settings);
             if (!settings.enabled) {
                 renderer.clear();
+            } else if (prevEvalTimestamp !== settings.evalTimestamp) {
+                scheduleGraphRebuild(50);
             }
             syncAnimationLoop();
         },
@@ -116,7 +119,7 @@ async function initScript(): Promise<void> {
                 return;
             }
             ui.setZoomWarning(false);
-            const graph = await buildRoadGraphFromSDK(wmeSDK);
+            const graph = await buildRoadGraphFromSDK(wmeSDK, settings.evalTimestamp);
             simulator.setGraph(graph);
             ui.updateTelemetry(simulator.getStats(), simulator.getHotspots());
         } catch (err) {

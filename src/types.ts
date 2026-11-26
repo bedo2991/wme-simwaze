@@ -8,6 +8,7 @@ export interface SimSettings {
     showHeatmap: boolean;
     showRoutesOnHover: boolean;
     showBugBadges: boolean;
+    evalTimestamp: string | null;
 }
 
 export const MIN_SIM_ZOOM = 16;
@@ -22,6 +23,7 @@ export const DEFAULT_SIM_SETTINGS: SimSettings = {
     showHeatmap: true,
     showRoutesOnHover: true,
     showBugBadges: true,
+    evalTimestamp: null,
 };
 
 export type BugKind =
@@ -63,6 +65,7 @@ export interface DirectedEdge {
     isDrivableDirection: boolean;
     isMapBorderExit: boolean;
     isDeadEnd: boolean;
+    restrictionPenaltyFactor: number;
     speedZones: SpeedZone[];
 }
 

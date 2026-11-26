@@ -22,6 +22,12 @@ import {
     WME_ROAD_TYPE,
 } from "./roadProfiles";
 import {
+    evaluateSegmentDirectionRestriction,
+    isClosureActiveAt,
+    isTurnBlockedAt,
+    resolveEvalDateTime,
+} from "./timeEval";
+import {
     BugKind,
     DiagnosticTransition,
     DirectedEdge,
@@ -42,68 +48,14 @@ export interface RawGraphInput {
     fallbackTurnAllowed?: Map<string, boolean>;
     viewportBBox?: [number, number, number, number] | null;
     permanentHazards?: PermanentHazard[];
+    evalTimestamp?: string | null;
+    nowMs?: number;
 }
 
 const MPH_TO_KMH = 1.609344;
 const DISCONNECTED_MAX_GAP_M = 12;
 const DISCONNECTED_MIN_GAP_M = 0.05;
 const GRID_CELL_DEG = 0.0003; // ~25-33m grid cells
-
-function isClosureActive(status: string): boolean {
-    return status === "ACTIVE" || status === "UNVERIFIED" || status === "UNKNOWN";
-}
-
-function isSegmentDirectionBlockedByRestriction(segment: Segment, isForward: boolean): boolean {
-    if (!segment.restrictions || segment.restrictions.length === 0) return false;
-    for (const r of segment.restrictions) {
-        if (r.isExpired) continue;
-        if (r.defaultType !== "BLOCKED") continue;
-        if (r.laneScope && r.laneScope !== "WHOLE_SEGMENT" && r.laneScope !== "NONE") continue;
-        const dirMatch =
-            r.direction === "BOTH" ||
-            r.direction === null ||
-            (isForward && r.direction === "FWD") ||
-            (!isForward && r.direction === "REV");
-        if (!dirMatch) continue;
-
-        const freeRules = r.vehicleRules?.FREE;
-        const privateAllowed =
-            Array.isArray(freeRules) &&
-            freeRules.some(
-                (vr) =>
-                    vr.minPassengers === 0 &&
-                    !vr.licensePlateRule &&
-                    vr.subscriptions.length === 0 &&
-                    (vr.vehicleTypes.length === 0 || vr.vehicleTypes.includes("PRIVATE"))
-            );
-        if (!privateAllowed) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function isTurnBlockedByRestriction(turn: Turn): boolean {
-    if (!turn.restrictions || turn.restrictions.length === 0) return false;
-    for (const r of turn.restrictions) {
-        if (r.isExpired) continue;
-        if (r.defaultType !== "BLOCKED") continue;
-        const freeRules = r.vehicleRules?.FREE;
-        const privateAllowed =
-            Array.isArray(freeRules) &&
-            freeRules.some(
-                (vr) =>
-                    vr.minPassengers === 0 &&
-                    !vr.licensePlateRule &&
-                    vr.subscriptions.length === 0 &&
-                    (vr.vehicleTypes.length === 0 || vr.vehicleTypes.includes("PRIVATE"))
-            );
-        if (!privateAllowed) {
-            return true;
-        }
-    }
-    return false;
-}
 
 function turnKey(fromSegId: number, fromFwd: boolean, toSegId: number, toFwd: boolean): string {
     return `${fromSegId}:${fromFwd ? 1 : 0}->${toSegId}:${toFwd ? 1 : 0}`;
@@ -375,7 +327,10 @@ function buildEdgeSpeedZones(
     return zones;
 }
 
-export async function fetchRawGraphData(wmeSDK: AsyncWmeSDK): Promise<RawGraphInput> {
+export async function fetchRawGraphData(
+    wmeSDK: AsyncWmeSDK,
+    evalTimestamp: string | null = null
+): Promise<RawGraphInput> {
     const [
         segments,
         nodes,
@@ -501,11 +456,15 @@ export async function fetchRawGraphData(wmeSDK: AsyncWmeSDK): Promise<RawGraphIn
         fallbackTurnAllowed,
         viewportBBox,
         permanentHazards,
+        evalTimestamp,
     };
 }
 
-export async function buildRoadGraphFromSDK(wmeSDK: AsyncWmeSDK): Promise<RoadGraph> {
-    const raw = await fetchRawGraphData(wmeSDK);
+export async function buildRoadGraphFromSDK(
+    wmeSDK: AsyncWmeSDK,
+    evalTimestamp: string | null = null
+): Promise<RoadGraph> {
+    const raw = await fetchRawGraphData(wmeSDK, evalTimestamp);
     return buildRoadGraphFromRawData(raw);
 }
 
@@ -601,19 +560,21 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
         }
     }
 
-    // Index active road closures by directed edge ID
+    const evalDt = resolveEvalDateTime(raw.evalTimestamp, raw.nowMs);
+
+    // Index active road closures by directed edge ID for the selected timestamp
     const closedEdges = new Set<string>();
-    const segmentWithDirectionalClosure = new Set<number>();
+    const segmentsWithClosureRecords = new Set<number>();
     for (const rc of raw.roadClosures) {
-        if (!isClosureActive(rc.status)) continue;
+        segmentsWithClosureRecords.add(rc.segmentId);
+        if (!isClosureActiveAt(rc, evalDt)) continue;
         closedEdges.add(`${rc.segmentId}:${rc.isForward ? "F" : "R"}`);
-        segmentWithDirectionalClosure.add(rc.segmentId);
     }
 
-    // Index active turn closures by "fromSegId->toSegId"
+    // Index active turn closures by "fromSegId->toSegId" for the selected timestamp
     const closedTurns = new Set<string>();
     for (const tc of raw.turnClosures) {
-        if (!isClosureActive(tc.status)) continue;
+        if (!isClosureActiveAt(tc, evalDt)) continue;
         closedTurns.add(`${tc.fromSegmentId}->${tc.toSegmentId}`);
     }
 
@@ -788,8 +749,10 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
 
             const hasExplicitClosure =
                 closedEdges.has(id) ||
-                (seg.hasClosures && !segmentWithDirectionalClosure.has(seg.id));
-            const isBlockedRestriction = isSegmentDirectionBlockedByRestriction(seg, isForward);
+                (!evalDt.isCustom && seg.hasClosures && !segmentsWithClosureRecords.has(seg.id));
+            const restrictionEffect = evaluateSegmentDirectionRestriction(seg, isForward, evalDt);
+            const isBlockedRestriction = restrictionEffect === "BLOCKED";
+            const restrictionPenaltyFactor = restrictionEffect === "DISCOURAGED" ? 4.0 : 1.0;
             const isClosed = hasExplicitClosure || isBlockedRestriction;
 
             const fromNodeId = isForward ? seg.fromNodeId : seg.toNodeId;
@@ -855,6 +818,7 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
                 isDrivableDirection: true,
                 isMapBorderExit: false,
                 isDeadEnd: false,
+                restrictionPenaltyFactor,
                 speedZones,
             };
 
@@ -928,7 +892,7 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
         }
         chain.push(lastEdgeId);
 
-        const allowed = pt.isAllowed && !isTurnBlockedByRestriction(pt);
+        const allowed = pt.isAllowed && !isTurnBlockedAt(pt, evalDt);
         if (allowed) {
             edgesWithAllowedPathTurn.add(firstEdgeId);
             for (let i = 0; i < chain.length - 1; i++) {
@@ -964,7 +928,7 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
                 }
 
                 const hasTurnClosure = closedTurns.has(`${inEdge.segmentId}->${outEdge.segmentId}`);
-                const hasTurnRestriction = turnRecord ? isTurnBlockedByRestriction(turnRecord) : false;
+                const hasTurnRestriction = turnRecord ? isTurnBlockedAt(turnRecord, evalDt) : false;
 
                 if (outEdge.isClosed || hasTurnClosure) {
                     transitions.push({
@@ -1388,6 +1352,16 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
     for (const e of allOpenEdges) {
         if (isAtMapBorder(e.fromNodeId, edgeStartCoord(e))) continue;
         if ((incomingLegal.get(e.id)?.length ?? 0) !== 0) continue;
+        const rawOpp = edges.get(`${e.segmentId}:${e.isForward ? "R" : "F"}`);
+        if (
+            rawOpp &&
+            rawOpp.isClosed &&
+            isDrivableLeafEndpoint(e.fromNodeId, edgeStartCoord(e))
+        ) {
+            outwardDeadEndOnly.add(e.id);
+            outQueue.push(e.id);
+            continue;
+        }
         const opp = getOppositeOpenEdge(e);
         if (
             opp &&
