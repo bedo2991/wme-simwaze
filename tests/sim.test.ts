@@ -12,6 +12,7 @@ import { distanceMeters, sampleEdgePosition, WebMercatorProjector } from "../src
 import { buildRoadGraphFromRawData, RawGraphInput } from "../src/graph";
 import { WME_ROAD_TYPE as ROAD_TYPE } from "../src/roadProfiles";
 import { findRoute, hasEnabledOutgoingTurn } from "../src/router";
+import { ScreensaverController } from "../src/screensaver";
 import { TrafficSimulator } from "../src/simulator";
 import { DEFAULT_SIM_SETTINGS, MIN_SIM_ZOOM } from "../src/types";
 
@@ -2069,5 +2070,97 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
     assertOk(proj.isCalibrated(), "Projector calibrated after coalesced sync");
 
     console.log("PASS: Test 17 — Dense edge indexing, one-way centering, route reuse & coalesced projector sync");
+
+    // ========================================================================
+    // Test 18: Screensaver mode starts after inactivity and stops only on map edit
+    // ========================================================================
+    {
+        let fakeNowMs = 1_000;
+        let nextTimerId = 1;
+        const scheduled = new Map<number, { dueMs: number; cb: () => void }>();
+        const advanceMs = (ms: number) => {
+            fakeNowMs += ms;
+            for (const [id, entry] of Array.from(scheduled.entries())) {
+                if (entry.dueMs <= fakeNowMs) {
+                    scheduled.delete(id);
+                    entry.cb();
+                }
+            }
+        };
+
+        const transitions: boolean[] = [];
+        const ss = new ScreensaverController({
+            enabled: true,
+            screensaverMode: true,
+            idleSeconds: 15,
+            now: () => fakeNowMs,
+            setTimer: (cb, delayMs) => {
+                const id = nextTimerId++;
+                scheduled.set(id, { dueMs: fakeNowMs + delayMs, cb });
+                return id as unknown as ReturnType<typeof setTimeout>;
+            },
+            clearTimer: (handle) => {
+                scheduled.delete(handle as unknown as number);
+            },
+            onDisplayStateChange: (display) => transitions.push(display),
+        });
+
+        assertEqual(ss.shouldDisplayWazers(), false, "Screensaver starts in standby (Wazers hidden)");
+
+        // User activity at t+10s resets the 15s inactivity countdown
+        advanceMs(10_000);
+        ss.notifyUserActivity(true);
+        advanceMs(10_000);
+        assertEqual(
+            ss.shouldDisplayWazers(),
+            false,
+            "Activity during standby resets countdown (still hidden 10s after activity)"
+        );
+
+        // Remaining 5s of inactivity elapses -> screensaver starts displaying Wazers
+        advanceMs(5_000);
+        assertEqual(ss.shouldDisplayWazers(), true, "Screensaver displays Wazers after 15s of inactivity");
+        assertDeepEqual(transitions, [true], "Emitted display=true on idle timeout");
+
+        // Non-edit user activity (mouse hover / map pan) does NOT dismiss active screensaver
+        ss.notifyUserActivity(true);
+        advanceMs(2_000);
+        assertEqual(
+            ss.shouldDisplayWazers(),
+            true,
+            "Mouse/pan activity does not stop displaying Wazers once screensaver is active"
+        );
+
+        // A map edit immediately hides Wazers and restarts the inactivity countdown
+        ss.notifyMapEdit();
+        assertEqual(
+            ss.shouldDisplayWazers(),
+            false,
+            "Map edit immediately stops displaying Wazers in screensaver mode"
+        );
+        assertDeepEqual(transitions, [true, false], "Emitted display=false on map edit");
+
+        // After another 15s of inactivity following the edit, Wazers reappear
+        advanceMs(15_000);
+        assertEqual(
+            ss.shouldDisplayWazers(),
+            true,
+            "Screensaver resumes displaying Wazers after another idle period"
+        );
+
+        // Switching off screensaver mode keeps Wazers continuously displayed even across map edits
+        ss.configure(true, false, 15);
+        assertEqual(ss.shouldDisplayWazers(), true, "Normal mode displays Wazers continuously");
+        ss.notifyMapEdit();
+        assertEqual(
+            ss.shouldDisplayWazers(),
+            true,
+            "Map edits do NOT stop displaying Wazers when screensaver mode is off"
+        );
+
+        ss.destroy();
+        console.log("PASS: Test 18 — Screensaver mode starts after inactivity and stops on map edit");
+    }
+
     console.log("ALL SIMWAZE TESTS PASSED");
 })();

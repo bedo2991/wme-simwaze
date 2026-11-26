@@ -23,6 +23,9 @@ export class SimSidebarUI {
     private enabledToggle: HTMLInputElement | null = null;
     private pauseBtn: HTMLButtonElement | null = null;
     private soundToggle: HTMLInputElement | null = null;
+    private screensaverToggle: HTMLInputElement | null = null;
+    private screensaverBoxEl: HTMLDivElement | null = null;
+    private screensaverStatusEl: HTMLElement | null = null;
     private zoomWarningEl: HTMLDivElement | null = null;
     private evalDateTimeInput: HTMLInputElement | null = null;
     private evalStatusEl: HTMLElement | null = null;
@@ -69,6 +72,31 @@ export class SimSidebarUI {
             this.enabledToggle.checked = enabled;
         }
         this.updatePauseButtonLabel();
+    }
+
+    public setScreensaverStatus(isScreensaverMode: boolean, isDisplaying: boolean): void {
+        if (this.screensaverBoxEl) {
+            this.screensaverBoxEl.hidden = !isScreensaverMode;
+        }
+        if (this.screensaverToggle) {
+            this.screensaverToggle.setAttribute("aria-expanded", String(isScreensaverMode));
+        }
+        if (!this.screensaverStatusEl) return;
+        if (!isScreensaverMode) {
+            this.screensaverStatusEl.hidden = true;
+            return;
+        }
+        this.screensaverStatusEl.hidden = false;
+        if (!this.settings.enabled) {
+            this.screensaverStatusEl.textContent = "Off";
+            this.screensaverStatusEl.classList.remove("is-active");
+        } else if (isDisplaying) {
+            this.screensaverStatusEl.textContent = "● Active";
+            this.screensaverStatusEl.classList.add("is-active");
+        } else {
+            this.screensaverStatusEl.textContent = "⏳ Standby";
+            this.screensaverStatusEl.classList.remove("is-active");
+        }
     }
 
     public setZoomWarning(visible: boolean, currentZoom?: number): void {
@@ -199,6 +227,32 @@ export class SimSidebarUI {
                 this.emitChange();
             });
         }
+
+        this.screensaverToggle = root.querySelector<HTMLInputElement>("#wme-sim-screensaver");
+        this.screensaverBoxEl = root.querySelector<HTMLDivElement>("#wme-sim-screensaver-box");
+        this.screensaverStatusEl = root.querySelector<HTMLElement>("#wme-sim-screensaver-status");
+        if (this.screensaverToggle) {
+            this.screensaverToggle.checked = this.settings.screensaverMode;
+            this.setScreensaverStatus(this.settings.screensaverMode, false);
+            this.screensaverToggle.addEventListener("change", () => {
+                this.settings.screensaverMode = Boolean(this.screensaverToggle?.checked);
+                this.setScreensaverStatus(this.settings.screensaverMode, false);
+                this.emitChange();
+            });
+        }
+
+        this.bindSlider(
+            root,
+            "#wme-sim-screensaver-delay",
+            "#wme-sim-screensaver-delay-val",
+            this.settings.screensaverIdleSeconds,
+            (val) => SimSidebarUI.formatIdleShort(val),
+            (val) => {
+                this.settings.screensaverIdleSeconds = val;
+                this.emitChange();
+            },
+            (val) => SimSidebarUI.formatIdleSpoken(val)
+        );
 
         root.querySelector<HTMLButtonElement>("#wme-sim-clear-btn")?.addEventListener("click", () => {
             this.callbacks.onClearAll();
@@ -336,13 +390,29 @@ export class SimSidebarUI {
         el.addEventListener("change", () => onChange(el.checked));
     }
 
+    private static formatIdleShort(sec: number): string {
+        if (sec < 60) return `${sec}s`;
+        const mins = Math.floor(sec / 60);
+        const rem = sec % 60;
+        return rem === 0 ? `${mins}m` : `${mins}m ${rem}s`;
+    }
+
+    private static formatIdleSpoken(sec: number): string {
+        if (sec < 60) return `${sec} seconds`;
+        const mins = Math.floor(sec / 60);
+        const rem = sec % 60;
+        const minLabel = mins === 1 ? "1 minute" : `${mins} minutes`;
+        return rem === 0 ? minLabel : `${minLabel} ${rem} seconds`;
+    }
+
     private bindSlider(
         root: HTMLDivElement,
         inputSel: string,
         valSel: string,
         initial: number,
         format: (v: number) => string,
-        onInput: (v: number) => void
+        onInput: (v: number) => void,
+        formatAria?: (v: number) => string
     ): void {
         const slider = root.querySelector<HTMLInputElement>(inputSel);
         const readout = root.querySelector<HTMLElement>(valSel);
@@ -354,7 +424,7 @@ export class SimSidebarUI {
             slider.style.setProperty("--attr-max", slider.max || "100");
             slider.style.setProperty("--control-value", String(val));
             const formatted = format(val);
-            slider.setAttribute("aria-valuetext", formatted);
+            slider.setAttribute("aria-valuetext", formatAria ? formatAria(val) : formatted);
             if (readout) readout.textContent = formatted;
         };
 
@@ -431,12 +501,51 @@ export class SimSidebarUI {
 
                 <div class="wme-sim-controls-row">
                     <label class="wme-sim-check-label" for="wme-sim-sound">
-                        <input type="checkbox" id="wme-sim-sound" class="wme-sim-checkbox">
+                        <input type="checkbox" id="wme-sim-sound" name="soundEnabled" class="wme-sim-checkbox">
                         <span>Tiny Horns &amp; Fire SFX</span>
                     </label>
                     <div class="wme-sim-btn-group">
                         <button type="button" id="wme-sim-rescan-btn" class="wme-sim-btn" title="Rebuild road graph">Rescan</button>
                         <button type="button" id="wme-sim-clear-btn" class="wme-sim-btn" title="Clear all active Wazers">Clear</button>
+                    </div>
+                </div>
+
+                <div class="wme-sim-screensaver-group">
+                    <div class="wme-sim-controls-row">
+                        <label class="wme-sim-check-label" for="wme-sim-screensaver">
+                            <input
+                                type="checkbox"
+                                id="wme-sim-screensaver"
+                                name="screensaverMode"
+                                class="wme-sim-checkbox"
+                                aria-controls="wme-sim-screensaver-box"
+                                aria-expanded="false"
+                            >
+                            <span>Screensaver Mode</span>
+                        </label>
+                        <span id="wme-sim-screensaver-status" class="wme-sim-mode-pill" role="status" hidden>⏳ Standby</span>
+                    </div>
+                    <div id="wme-sim-screensaver-box" class="wme-sim-screensaver-box" hidden>
+                        <div class="wme-sim-slider-field">
+                            <div class="wme-sim-slider-head">
+                                <label for="wme-sim-screensaver-delay">Inactivity Delay</label>
+                                <span id="wme-sim-screensaver-delay-val" class="wme-sim-val">30s</span>
+                            </div>
+                            <input
+                                type="range"
+                                id="wme-sim-screensaver-delay"
+                                name="screensaverIdleSeconds"
+                                class="wme-sim-slider"
+                                min="2"
+                                max="300"
+                                step="2"
+                                value="6"
+                                aria-describedby="wme-sim-screensaver-help"
+                            >
+                            <span id="wme-sim-screensaver-help" class="wme-sim-field-hint">
+                                Starts after inactivity; hides as soon as you edit the map.
+                            </span>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -537,7 +646,13 @@ export class SimSidebarUI {
                         <p class="wme-sim-note">
                             Wazers spawn across all drivable roads weighted by road importance and prioritize higher-tier roads while obeying real speed limits, turn permissions, and active closures.
                         </p>
-                        <ul class="wme-sim-legend">${legendRows}</ul>
+                        <div class="wme-sim-legend" role="table" aria-label="Road capacity and spawn rules">
+                            <div class="wme-sim-legend-header" role="row">
+                                <span role="columnheader">Road Type</span>
+                                <span role="columnheader">Default lanes / speed</span>
+                            </div>
+                            ${legendRows.replace(/<li>/g, '<div role="row">').replace(/<\/li>/g, '</div>').replace(/<span class="wme-sim-legend-name">/g, '<span class="wme-sim-legend-name" role="cell">').replace(/<span class="wme-sim-legend-meta">/g, '<span class="wme-sim-legend-meta" role="cell">')}
+                        </div>
                     </div>
                 </details>
             </section>
@@ -945,7 +1060,6 @@ export class SimSidebarUI {
                 color: var(--content_p2, #5f6368);
             }
             .wme-sim-legend {
-                list-style: none;
                 margin: 0;
                 padding: 0;
                 display: flex;
@@ -953,11 +1067,23 @@ export class SimSidebarUI {
                 gap: 4px;
                 font-size: 12px;
             }
-            .wme-sim-legend li {
-                display: flex;
-                justify-content: space-between;
+            .wme-sim-legend-header,
+            .wme-sim-legend [role="row"] {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto;
                 align-items: center;
-                gap: 8px;
+                column-gap: 8px;
+            }
+            .wme-sim-legend-header {
+                padding-block-end: 4px;
+                border-block-end: 1px solid var(--hairline, rgba(128, 128, 128, 0.25));
+                font-size: 10px;
+                font-weight: 700;
+                color: var(--content_p2, #5f6368);
+            }
+            .wme-sim-legend-header [role="columnheader"]:last-child,
+            .wme-sim-legend-meta {
+                text-align: right;
             }
             .wme-sim-legend-name {
                 display: inline-flex;
@@ -1022,6 +1148,25 @@ export class SimSidebarUI {
             .wme-sim-mode-pill.is-custom {
                 background: rgba(26, 115, 232, 0.16);
                 color: #1a73e8;
+            }
+            .wme-sim-mode-pill.is-active {
+                background: rgba(5, 150, 105, 0.16);
+                color: #059669;
+            }
+            .wme-sim-screensaver-group {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding-block-start: 4px;
+                border-block-start: 1px solid var(--hairline, rgba(128, 128, 128, 0.2));
+            }
+            .wme-sim-screensaver-box {
+                padding-block-end: 2px;
+            }
+            .wme-sim-checkbox:disabled,
+            .wme-sim-slider:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
             }
             .wme-sim-btn-sm {
                 padding: 3px 8px;

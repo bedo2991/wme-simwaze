@@ -2,6 +2,8 @@ export interface SimSettings {
     enabled: boolean;
     paused: boolean;
     soundEnabled: boolean;
+    screensaverMode: boolean;
+    screensaverIdleSeconds: number;
     maxWazers: number;
     simSpeed: number;
     patienceSeconds: number;
@@ -17,6 +19,8 @@ export const DEFAULT_SIM_SETTINGS: SimSettings = {
     enabled: true,
     paused: false,
     soundEnabled: false,
+    screensaverMode: false,
+    screensaverIdleSeconds: 30,
     maxWazers: 42,
     simSpeed: 1.5,
     patienceSeconds: 10,
