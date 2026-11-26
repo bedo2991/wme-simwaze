@@ -2162,5 +2162,116 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         console.log("PASS: Test 18 — Screensaver mode starts after inactivity and stops on map edit");
     }
 
+    // ========================================================================
+    // Test 19: Smooth C1 junction turn arcs & polyline bends (zero spatial/angular jumps)
+    // ========================================================================
+    {
+        const raw = baseRaw({
+            segments: [
+                // Two-way 2-lane street Eastbound with an interior bend -> Node 2
+                makeSegment(
+                    1,
+                    [
+                        [12.0, 45.0],
+                        [12.0005, 45.0001],
+                        [12.001, 45.0],
+                    ],
+                    {
+                        roadType: ROAD_TYPE.PRIMARY_STREET,
+                        fromNodeId: 1,
+                        toNodeId: 2,
+                        isTwoWay: true,
+                        fromNodeLanesCount: 2,
+                        toNodeLanesCount: 2,
+                        fwdSpeedLimit: 50,
+                    }
+                ),
+                // 90-deg Right turn onto One-Way 1-lane ramp/connector Southbound -> Node 3
+                makeSegment(2, [[12.001, 45.0], [12.001, 44.9994]], {
+                    roadType: ROAD_TYPE.RAMP,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    isTwoWay: false,
+                    isAtoB: true,
+                    fromNodeLanesCount: 1,
+                    fwdSpeedLimit: 40,
+                }),
+                // 90-deg Left turn back onto Two-Way 2-lane street Eastbound -> Node 4
+                makeSegment(3, [[12.001, 44.9994], [12.002, 44.9994]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 3,
+                    toNodeId: 4,
+                    isTwoWay: true,
+                    fromNodeLanesCount: 2,
+                    toNodeLanesCount: 2,
+                    fwdSpeedLimit: 50,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0, 45.0, [1]),
+                makeNode(2, 12.001, 45.0, [1, 2]),
+                makeNode(3, 12.001, 44.9994, [2, 3]),
+                makeNode(4, 12.002, 44.9994, [3]),
+            ],
+            streets: [
+                makeStreet(1, "Curved TwoWay Ave"),
+                makeStreet(2, "OneWay Connector"),
+                makeStreet(3, "Lower TwoWay Ave"),
+            ],
+        });
+
+        const graph = buildRoadGraphFromRawData(raw);
+        const sim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 1 },
+            { rng: () => 0.7 }
+        );
+        sim.setGraph(graph);
+        const w = sim.spawnSpecificWazer("1:F", "3:F")!;
+        assertOk(w, "Wazer spawned for junction continuity test");
+
+        const dt = 1 / 60;
+        let prevLon = w.lon;
+        let prevLat = w.lat;
+        let prevBearing = w.bearingScreenRad;
+        let maxStepJumpMeters = 0;
+        let maxHeadingDeltaRad = 0;
+        let visitedSeg2 = false;
+        let visitedSeg3 = false;
+
+        for (let frame = 0; frame < 2400; frame++) {
+            sim.step(dt);
+            if (sim.getWazers().length === 0) break;
+            if (w.edgeId === "2:F") visitedSeg2 = true;
+            if (w.edgeId === "3:F") visitedSeg3 = true;
+
+            const stepMeters = distanceMeters(prevLon, prevLat, w.lon, w.lat, graph.cosLat);
+            if (stepMeters > maxStepJumpMeters) maxStepJumpMeters = stepMeters;
+
+            let dTheta = Math.abs(w.bearingScreenRad - prevBearing);
+            while (dTheta > Math.PI) dTheta = Math.abs(dTheta - Math.PI * 2);
+            if (dTheta > maxHeadingDeltaRad) maxHeadingDeltaRad = dTheta;
+
+            // At <= ~60 km/h and 60 FPS, a physical step is <= ~0.28m; ensure zero multi-meter jumps
+            assertOk(
+                stepMeters < 0.65,
+                `Smooth frame displacement (${stepMeters.toFixed(3)}m) on edge ${w.edgeId}`
+            );
+            assertOk(
+                dTheta < 0.35,
+                `Smooth heading rotation (${((dTheta * 180) / Math.PI).toFixed(1)} deg) on edge ${w.edgeId}`
+            );
+
+            prevLon = w.lon;
+            prevLat = w.lat;
+            prevBearing = w.bearingScreenRad;
+        }
+
+        assertOk(visitedSeg2 && visitedSeg3, "Wazer traversed both 90-deg junction nodes");
+        assertOk(sim.getStats().arrivedCount === 1, "Wazer arrived smoothly at destination");
+        console.log(
+            `PASS: Test 19 — Smooth junction arcs (maxStep=${maxStepJumpMeters.toFixed(3)}m, maxTurnStep=${((maxHeadingDeltaRad * 180) / Math.PI).toFixed(1)}°)`
+        );
+    }
+
     console.log("ALL SIMWAZE TESTS PASSED");
 })();

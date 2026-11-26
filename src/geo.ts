@@ -1,5 +1,5 @@
 import { AsyncWmeSDK, ZoomLevel } from "wme-sdk-typings";
-import { DirectedEdge } from "./types";
+import { DirectedEdge, JunctionArcState } from "./types";
 
 export const EARTH_RADIUS_M = 6371000;
 export const DEG_TO_RAD = Math.PI / 180;
@@ -132,8 +132,23 @@ export interface SampledEdgePose {
     bearingScreenRad: number;
 }
 
+function subSegmentUnitTangent(
+    coords: [number, number][],
+    idx: number,
+    scaleX: number
+): [number, number] {
+    const a = coords[idx];
+    const b = coords[idx + 1];
+    const dx = (b[0] - a[0]) * scaleX;
+    const dy = (b[1] - a[1]) * METERS_PER_DEG_LAT;
+    const len = Math.hypot(dx, dy);
+    return len > 1e-6 ? [dx / len, dy / len] : [1, 0];
+}
+
 /**
  * Zero-allocation in-place edge position sampler for hot simulation loops.
+ * Smooths unit tangents across interior polyline vertices so curved multi-vertex
+ * segments produce C1-continuous lane offsets and headings without kinks.
  */
 export function sampleEdgePositionInto(
     out: SampledEdgePose,
@@ -148,10 +163,17 @@ export function sampleEdgePositionInto(
     const cumLengths = edge.cumLengths;
     const n = coords.length;
 
+    const fallbackLat = n > 0 ? coords[0][1] : 0;
+    const cosLat =
+        cosLatOverride !== undefined
+            ? cosLatOverride
+            : Math.max(0.1, Math.cos(fallbackLat * DEG_TO_RAD));
+    const scaleX = METERS_PER_DEG_LAT * cosLat;
+
     let sampleLon = 0;
     let sampleLat = 0;
-    let tangentLon = 1;
-    let tangentLat = 0;
+    let ux = 1;
+    let uy = 0;
 
     if (n === 1) {
         sampleLon = coords[0][0];
@@ -170,30 +192,55 @@ export function sampleEdgePositionInto(
             }
         }
         const startD = cumLengths[lo];
-        const segLen = cumLengths[lo + 1] - startD;
+        const endD = cumLengths[lo + 1];
+        const segLen = endD - startD;
         const ratio = segLen > 1e-6 ? (d - startD) / segLen : 0;
         const a = coords[lo];
         const b = coords[lo + 1];
-        tangentLon = b[0] - a[0];
-        tangentLat = b[1] - a[1];
-        sampleLon = a[0] + tangentLon * ratio;
-        sampleLat = a[1] + tangentLat * ratio;
-    }
+        sampleLon = a[0] + (b[0] - a[0]) * ratio;
+        sampleLat = a[1] + (b[1] - a[1]) * ratio;
 
-    const cosLat =
-        cosLatOverride !== undefined
-            ? cosLatOverride
-            : Math.max(0.1, Math.cos(sampleLat * DEG_TO_RAD));
-    const scaleX = METERS_PER_DEG_LAT * cosLat;
-    const dxMeters = tangentLon * scaleX;
-    const dyMeters = tangentLat * METERS_PER_DEG_LAT;
-    const len = Math.hypot(dxMeters, dyMeters);
+        const [curUx, curUy] = subSegmentUnitTangent(coords, lo, scaleX);
+        ux = curUx;
+        uy = curUy;
 
-    let ux = 1;
-    let uy = 0;
-    if (len > 1e-6) {
-        ux = dxMeters / len;
-        uy = dyMeters / len;
+        // Smooth tangent & normal near interior polyline vertices for C1 continuity
+        if (n >= 3 && segLen > 0.1) {
+            const blendWindow = Math.min(3.5, segLen * 0.45);
+            if (lo > 0 && d - startD < blendWindow) {
+                const [prevUx, prevUy] = subSegmentUnitTangent(coords, lo - 1, scaleX);
+                const bx = prevUx + curUx;
+                const by = prevUy + curUy;
+                const bLen = Math.hypot(bx, by);
+                if (bLen > 1e-5) {
+                    const t = 1 - (d - startD) / blendWindow;
+                    const s = t * t * (3 - 2 * t);
+                    const mx = curUx + (bx / bLen - curUx) * s;
+                    const my = curUy + (by / bLen - curUy) * s;
+                    const mLen = Math.hypot(mx, my);
+                    if (mLen > 1e-6) {
+                        ux = mx / mLen;
+                        uy = my / mLen;
+                    }
+                }
+            } else if (lo < n - 2 && endD - d < blendWindow) {
+                const [nextUx, nextUy] = subSegmentUnitTangent(coords, lo + 1, scaleX);
+                const bx = curUx + nextUx;
+                const by = curUy + nextUy;
+                const bLen = Math.hypot(bx, by);
+                if (bLen > 1e-5) {
+                    const t = 1 - (endD - d) / blendWindow;
+                    const s = t * t * (3 - 2 * t);
+                    const mx = curUx + (bx / bLen - curUx) * s;
+                    const my = curUy + (by / bLen - curUy) * s;
+                    const mLen = Math.hypot(mx, my);
+                    if (mLen > 1e-6) {
+                        ux = mx / mLen;
+                        uy = my / mLen;
+                    }
+                }
+            }
+        }
     }
 
     out.bearingScreenRad = Math.atan2(-uy, ux);
@@ -207,6 +254,114 @@ export function sampleEdgePositionInto(
 
     out.lon = sampleLon + (uy * roadOffset) / scaleX;
     out.lat = sampleLat + (-ux * roadOffset) / METERS_PER_DEG_LAT;
+}
+
+/**
+ * Builds a C1-continuous Cubic Hermite turn/transition arc connecting incoming pose `p0`
+ * to outgoing pose `p1` across a junction node (eliminating corner, lane-count, and
+ * one-way/two-way offset jumps).
+ */
+export function buildJunctionArc(
+    p0: SampledEdgePose,
+    p1: SampledEdgePose,
+    exitDistOnEdge: number,
+    cosLat: number,
+    maxSpeedMps = Infinity
+): JunctionArcState {
+    const scaleX = METERS_PER_DEG_LAT * Math.max(0.1, cosLat);
+    const dx = (p1.lon - p0.lon) * scaleX;
+    const dy = (p1.lat - p0.lat) * METERS_PER_DEG_LAT;
+    const chord = Math.hypot(dx, dy);
+
+    const u0x = Math.cos(p0.bearingScreenRad);
+    const u0y = -Math.sin(p0.bearingScreenRad);
+    const u1x = Math.cos(p1.bearingScreenRad);
+    const u1y = -Math.sin(p1.bearingScreenRad);
+
+    const dot0 = dx * u0x + dy * u0y;
+    const dot1 = dx * u1x + dy * u1y;
+    const minForward = Math.min(Math.max(0, dot0), Math.max(0, dot1));
+    const tangentScaleMeters =
+        chord < 0.1
+            ? 0.05
+            : Math.min(0.55 * chord, Math.max(0.2 * chord, 0.85 * minForward + 0.15 * chord));
+
+    const m0x = u0x * tangentScaleMeters;
+    const m0y = u0y * tangentScaleMeters;
+    const m1x = u1x * tangentScaleMeters;
+    const m1y = u1y * tangentScaleMeters;
+
+    // 4-step chord quadrature for accurate constant-speed arc length
+    let arcLen = 0;
+    let prevX = 0;
+    let prevY = 0;
+    for (let step = 1; step <= 4; step++) {
+        const t = step * 0.25;
+        const t2 = t * t;
+        const t3 = t2 * t;
+        const h10 = t3 - 2 * t2 + t;
+        const h01 = -2 * t3 + 3 * t2;
+        const h11 = t3 - t2;
+        const cx = h10 * m0x + h01 * dx + h11 * m1x;
+        const cy = h10 * m0y + h01 * dy + h11 * m1y;
+        arcLen += Math.hypot(cx - prevX, cy - prevY);
+        prevX = cx;
+        prevY = cy;
+    }
+
+    return {
+        traveledMeters: 0,
+        totalMeters: Math.max(0.15, arcLen),
+        exitDistOnEdge,
+        maxSpeedMps,
+        p0Lon: p0.lon,
+        p0Lat: p0.lat,
+        u0x,
+        u0y,
+        p1Lon: p1.lon,
+        p1Lat: p1.lat,
+        u1x,
+        u1y,
+        tangentScaleMeters,
+    };
+}
+
+export function sampleJunctionArcInto(
+    out: SampledEdgePose,
+    arc: JunctionArcState,
+    uRaw: number,
+    cosLat: number
+): void {
+    const t = uRaw <= 0 ? 0 : uRaw >= 1 ? 1 : uRaw;
+    const scaleX = METERS_PER_DEG_LAT * Math.max(0.1, cosLat);
+    const dx = (arc.p1Lon - arc.p0Lon) * scaleX;
+    const dy = (arc.p1Lat - arc.p0Lat) * METERS_PER_DEG_LAT;
+
+    const s = arc.tangentScaleMeters;
+    const m0x = arc.u0x * s;
+    const m0y = arc.u0y * s;
+    const m1x = arc.u1x * s;
+    const m1y = arc.u1y * s;
+
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const h10 = t3 - 2 * t2 + t;
+    const h01 = -2 * t3 + 3 * t2;
+    const h11 = t3 - t2;
+
+    const px = h10 * m0x + h01 * dx + h11 * m1x;
+    const py = h10 * m0y + h01 * dy + h11 * m1y;
+
+    const dh10 = 3 * t2 - 4 * t + 1;
+    const dh01 = 6 * t - 6 * t2;
+    const dh11 = 3 * t2 - 2 * t;
+    const tx = dh10 * m0x + dh01 * dx + dh11 * m1x;
+    const ty = dh10 * m0y + dh01 * dy + dh11 * m1y;
+
+    out.lon = arc.p0Lon + px / scaleX;
+    out.lat = arc.p0Lat + py / METERS_PER_DEG_LAT;
+    out.bearingScreenRad =
+        Math.hypot(tx, ty) > 1e-6 ? Math.atan2(-ty, tx) : Math.atan2(-arc.u1y, arc.u1x);
 }
 
 export function sampleEdgePosition(

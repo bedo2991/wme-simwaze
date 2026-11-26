@@ -463,7 +463,7 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
         normCoordsBySegId.set(seg.id, coords);
 
         const { cumLengths: fwdCumLengths, totalLength } = computeCumulativeLengths(coords, cosLat);
-        const lengthMeters = Math.max(totalLength, seg.length || 1, 1);
+        const lengthMeters = totalLength > 0.1 ? totalLength : Math.max(seg.length || 1, 1);
 
         const { fwdAllowed, revAllowed, isDirectionless } = getSegmentAllowedDirections(seg);
         const isTwoWay = fwdAllowed && revAllowed;

@@ -1,5 +1,12 @@
 import { SimAudioEngine } from "./audio";
-import { distanceMeters, sampleEdgePositionInto, samplePolylineAt } from "./geo";
+import {
+    buildJunctionArc,
+    distanceMeters,
+    SampledEdgePose,
+    sampleEdgePositionInto,
+    sampleJunctionArcInto,
+    samplePolylineAt,
+} from "./geo";
 import {
     computeTurnDeflectionDeg,
     edgeDistanceMeters,
@@ -99,6 +106,8 @@ export class TrafficSimulator {
     private bucketPool: WazerAgent[][] = [];
     private laneLeadersScratch: Array<WazerAgent | null> = new Array(8).fill(null);
     private removedIdSet = new Set<number>();
+    private arcP0Scratch: SampledEdgePose = { lon: 0, lat: 0, bearingScreenRad: 0 };
+    private arcP1Scratch: SampledEdgePose = { lon: 0, lat: 0, bearingScreenRad: 0 };
 
     private nextWazerId = 1;
     private arrivedCount = 0;
@@ -249,7 +258,9 @@ export class TrafficSimulator {
                 }
                 const destEdge = newGraph.edges.get(w.destEdgeId);
                 if (destEdge) w.destStreetName = destEdge.streetName;
-                this.syncPoseAndFacing(w, edge, newGraph);
+                if (!w.junctionArc) {
+                    this.syncPoseAndFacing(w, edge, newGraph);
+                }
                 surviving.push(w);
                 this.edgeOccupancy.set(w.edgeId, (this.edgeOccupancy.get(w.edgeId) ?? 0) + 1);
                 continue;
@@ -312,6 +323,7 @@ export class TrafficSimulator {
             w.routeEdgeIds = newRoute.routeEdgeIds;
             w.routeIndex = 0;
             w.terminalBug = newRoute.terminalBug;
+            w.junctionArc = null;
             this.syncPoseAndFacing(w, edge, newGraph);
 
             if (wasStuckOnBug && newRoute.terminalBug === null) {
@@ -379,6 +391,7 @@ export class TrafficSimulator {
             distOnEdge: initialDist,
             laneIndex,
             lateralOffset: 0,
+            junctionArc: null,
             lon: 0,
             lat: 0,
             bearingScreenRad: 0,
@@ -584,7 +597,7 @@ export class TrafficSimulator {
 
                 // Multi-lane opportunistic lane switch if current lane is blocked closely ahead
                 const currentLeader = laneLeader[w.laneIndex];
-                if (edge.lanes > 1 && currentLeader) {
+                if (!w.junctionArc && edge.lanes > 1 && currentLeader) {
                     const currentGap = currentLeader.distOnEdge - w.distOnEdge;
                     if (currentGap < MIN_GAP_METERS * 2.2) {
                         for (let candLane = 0; candLane < edge.lanes; candLane++) {
@@ -688,6 +701,10 @@ export class TrafficSimulator {
                 let desiredSpeed = Math.min(openRoadTarget, leaderCapMps);
 
                 const stopLine = Math.max(0.5, edge.lengthMeters - STOP_LINE_METERS);
+                let canEnterNext = false;
+                let chosenNextLane = 0;
+                let arcEntryDist = stopLine;
+                let arcExitDist = 0;
 
                 if (isLastRouteEdge) {
                     if (w.terminalBug !== null) {
@@ -713,7 +730,7 @@ export class TrafficSimulator {
                                 }
                             }
                         }
-                        if (w.distOnEdge >= targetEnd - 1.5 || exitedViewport) {
+                        if (!w.junctionArc && (w.distOnEdge >= targetEnd - 1.5 || exitedViewport)) {
                             this.arrivedCount++;
                             if (!edge.isMapBorderExit) {
                                 this.syncPoseAndFacing(w, edge, g);
@@ -733,8 +750,20 @@ export class TrafficSimulator {
                         }
                     }
                 } else {
-                    let canEnterNext = false;
-                    let chosenNextLane = 0;
+                    if (nextEdge) {
+                        const off0 =
+                            (edge.isTwoWay ? 2.6 : 0) +
+                            Math.abs((w.laneIndex - (edge.lanes - 1) * 0.5) * 3.2) +
+                            Math.abs(w.lateralOffset);
+                        const off1 =
+                            (nextEdge.isTwoWay ? 2.6 : 0) + (nextEdge.lanes - 1) * 0.5 * 3.2;
+                        const leadIn = Math.min(7.5, Math.max(3.0, Math.max(off0, off1) + 1.4));
+                        arcEntryDist = Math.max(
+                            0.5,
+                            edge.lengthMeters - Math.min(leadIn, edge.lengthMeters * 0.4)
+                        );
+                        arcExitDist = Math.min(leadIn, nextEdge.lengthMeters * 0.4);
+                    }
 
                     if (nextEdge && !nextEdge.isClosed) {
                         const nextOcc = this.edgeOccupancy.get(nextEdge.id) ?? 0;
@@ -750,12 +779,17 @@ export class TrafficSimulator {
 
                         if (nextOcc < nextEdge.maxCapacity && !nodeBlocked) {
                             const nextList = byEdge.get(nextEdge.id);
+                            const preNodeDist = Math.max(0, edge.lengthMeters - arcEntryDist);
                             chosenNextLane = Math.min(w.laneIndex, nextEdge.lanes - 1);
                             const checkLaneClear = (lane: number): boolean => {
                                 if (!nextList) return true;
                                 for (let ni = nextList.length - 1; ni >= 0; ni--) {
                                     const other = nextList[ni];
-                                    if (other.laneIndex === lane && other.distOnEdge < MIN_GAP_METERS) {
+                                    if (other.laneIndex !== lane) continue;
+                                    const gapAcrossNode = other.junctionArc
+                                        ? other.junctionArc.traveledMeters
+                                        : preNodeDist + other.distOnEdge;
+                                    if (gapAcrossNode < MIN_GAP_METERS) {
                                         return false;
                                     }
                                 }
@@ -777,56 +811,17 @@ export class TrafficSimulator {
                     }
 
                     if (!canEnterNext) {
-                        const distToStop = stopLine - w.distOnEdge;
+                        const waitStop =
+                            w.distOnEdge > arcEntryDist
+                                ? Math.min(Math.max(0.5, edge.lengthMeters - 1.2), w.distOnEdge)
+                                : arcEntryDist;
+                        const distToStop = waitStop - w.distOnEdge;
                         if (distToStop <= 0.6) {
                             desiredSpeed = 0;
                         } else if (distToStop < 22) {
                             desiredSpeed = Math.min(desiredSpeed, edge.speedMps * (distToStop / 22));
                         }
-                        maxPos = Math.min(maxPos, stopLine);
-                    } else if (w.distOnEdge + Math.max(w.speedMps, 2) * dt >= edge.lengthMeters) {
-                        const oldOcc = this.edgeOccupancy.get(edge.id) ?? 1;
-                        this.edgeOccupancy.set(edge.id, Math.max(0, oldOcc - 1));
-
-                        const turnDeg = lookupTurnDeflectionDeg(g, edge, nextEdge!);
-                        if (turnDeg >= 45) {
-                            w.openRoadSeconds *= 0.35;
-                        }
-
-                        w.routeIndex++;
-                        w.edgeId = nextEdge!.id;
-                        const overflow = Math.max(
-                            0.2,
-                            w.distOnEdge + w.speedMps * dt - edge.lengthMeters
-                        );
-                        w.distOnEdge = Math.min(overflow, Math.max(0.2, nextEdge!.lengthMeters * 0.25));
-                        w.laneIndex = chosenNextLane;
-                        w.lateralOffset = 0;
-                        this.syncPoseAndFacing(w, nextEdge!, g);
-
-                        this.edgeOccupancy.set(
-                            nextEdge!.id,
-                            (this.edgeOccupancy.get(nextEdge!.id) ?? 0) + 1
-                        );
-                        let nextList = byEdge.get(nextEdge!.id);
-                        if (!nextList) {
-                            nextList = this.acquireBucket();
-                            byEdge.set(nextEdge!.id, nextList);
-                        }
-                        nextList.push(w);
-
-                        if (edge.toNodeId != null) {
-                            const nodeObj = g.nodes.get(edge.toNodeId);
-                            if (nodeObj && nodeObj.connectedSegmentIds.length > 2) {
-                                this.nodeCooldowns.set(
-                                    edge.toNodeId,
-                                    1 / Math.max(1.2, nodeObj.lanesCapacity * 0.9)
-                                );
-                            }
-                        }
-
-                        this.updateChaosState(w, nextEdge!, dt, clampedRawDt);
-                        continue;
+                        maxPos = Math.min(maxPos, waitStop);
                     }
                 }
 
@@ -844,7 +839,150 @@ export class TrafficSimulator {
                     w.speedMps = Math.max(desiredSpeed, w.speedMps - decelRate * dt);
                 }
 
-                const nextDist = Math.min(maxPos, w.distOnEdge + w.speedMps * dt);
+                const stepDist = w.speedMps * dt;
+
+                // 1. If currently rounding a C1 Hermite junction arc, advance smoothly along it
+                if (w.junctionArc) {
+                    const arc = w.junctionArc;
+                    arc.traveledMeters += stepDist;
+                    if (arc.traveledMeters < arc.totalMeters) {
+                        const u = arc.traveledMeters / arc.totalMeters;
+                        w.distOnEdge = Math.min(maxPos, u * arc.exitDistOnEdge);
+                        if (w.distOnEdge >= maxPos - 0.05 && desiredSpeed === 0) {
+                            w.speedMps = 0;
+                        }
+                        sampleJunctionArcInto(w, arc, u, g.cosLat);
+                        this.syncFacingFromBearing(w);
+                        laneLeader[w.laneIndex] = w;
+                        this.updateChaosState(w, edge, dt, clampedRawDt);
+                        continue;
+                    }
+                    // Completed junction arc — continue seamlessly along current edge from exitDistOnEdge
+                    const remPastArc = arc.traveledMeters - arc.totalMeters;
+                    const exitBase = arc.exitDistOnEdge;
+                    w.junctionArc = null;
+                    const postArcDist = Math.min(maxPos, exitBase + remPastArc);
+                    if (postArcDist >= maxPos - 0.05 && desiredSpeed === 0) {
+                        w.speedMps = 0;
+                    }
+                    w.distOnEdge = Math.max(0, postArcDist);
+                    this.syncPoseAndFacing(w, edge, g);
+                    laneLeader[w.laneIndex] = w;
+                    this.updateChaosState(w, edge, dt, clampedRawDt);
+                    continue;
+                }
+
+                // 2. Entering junction turn/transition zone into nextEdge via smooth Hermite arc
+                if (
+                    !isLastRouteEdge &&
+                    canEnterNext &&
+                    nextEdge &&
+                    w.distOnEdge + stepDist >= arcEntryDist
+                ) {
+                    let intoArc: number;
+                    if (w.distOnEdge < arcEntryDist) {
+                        intoArc = w.distOnEdge + stepDist - arcEntryDist;
+                        sampleEdgePositionInto(
+                            this.arcP0Scratch,
+                            edge,
+                            arcEntryDist,
+                            w.laneIndex,
+                            g.isLeftHandTraffic,
+                            w.lateralOffset,
+                            g.cosLat
+                        );
+                    } else {
+                        intoArc = stepDist;
+                        this.arcP0Scratch.lon = w.lon;
+                        this.arcP0Scratch.lat = w.lat;
+                        this.arcP0Scratch.bearingScreenRad = w.bearingScreenRad;
+                    }
+
+                    sampleEdgePositionInto(
+                        this.arcP1Scratch,
+                        nextEdge,
+                        arcExitDist,
+                        chosenNextLane,
+                        g.isLeftHandTraffic,
+                        0,
+                        g.cosLat
+                    );
+
+                    const turnDeg = lookupTurnDeflectionDeg(g, edge, nextEdge);
+                    if (turnDeg >= 45) {
+                        w.openRoadSeconds *= 0.35;
+                    }
+
+                    let cornerMaxMps = Infinity;
+                    if (edge.junctionId == null && nextEdge.junctionId != null) {
+                        cornerMaxMps = 7.5;
+                    } else if (turnDeg >= 115) {
+                        cornerMaxMps = 4.5;
+                    } else if (turnDeg >= 60) {
+                        cornerMaxMps = 6.5;
+                    } else if (turnDeg >= 30) {
+                        cornerMaxMps = Math.min(11.5, nextEdge.speedMps * 0.85);
+                    }
+
+                    const arc = buildJunctionArc(
+                        this.arcP0Scratch,
+                        this.arcP1Scratch,
+                        arcExitDist,
+                        g.cosLat,
+                        cornerMaxMps
+                    );
+
+                    const oldOcc = this.edgeOccupancy.get(edge.id) ?? 1;
+                    this.edgeOccupancy.set(edge.id, Math.max(0, oldOcc - 1));
+
+                    w.routeIndex++;
+                    w.edgeId = nextEdge.id;
+                    w.laneIndex = chosenNextLane;
+                    w.lateralOffset = 0;
+
+                    if (intoArc < arc.totalMeters) {
+                        arc.traveledMeters = intoArc;
+                        w.junctionArc = arc;
+                        const u = intoArc / arc.totalMeters;
+                        w.distOnEdge = u * arcExitDist;
+                        sampleJunctionArcInto(w, arc, u, g.cosLat);
+                        this.syncFacingFromBearing(w);
+                    } else {
+                        w.junctionArc = null;
+                        w.distOnEdge = Math.min(
+                            nextEdge.lengthMeters - 0.5,
+                            arcExitDist + (intoArc - arc.totalMeters)
+                        );
+                        this.syncPoseAndFacing(w, nextEdge, g);
+                    }
+
+                    this.edgeOccupancy.set(
+                        nextEdge.id,
+                        (this.edgeOccupancy.get(nextEdge.id) ?? 0) + 1
+                    );
+                    let nextList = byEdge.get(nextEdge.id);
+                    if (!nextList) {
+                        nextList = this.acquireBucket();
+                        byEdge.set(nextEdge.id, nextList);
+                    }
+                    nextList.push(w);
+
+                    if (edge.toNodeId != null) {
+                        const nodeObj = g.nodes.get(edge.toNodeId);
+                        if (nodeObj && nodeObj.connectedSegmentIds.length > 2) {
+                            this.nodeCooldowns.set(
+                                edge.toNodeId,
+                                1 / Math.max(1.2, nodeObj.lanesCapacity * 0.9)
+                            );
+                        }
+                    }
+
+                    this.updateChaosState(w, nextEdge, dt, clampedRawDt);
+                    continue;
+                }
+
+                // 3. Standard open-segment advance
+                const nextDist = Math.min(maxPos, w.distOnEdge + stepDist);
                 if (nextDist >= maxPos - 0.05 && desiredSpeed === 0) {
                     w.speedMps = 0;
                 }
@@ -871,7 +1009,7 @@ export class TrafficSimulator {
             if (w.state === "ON_FIRE") {
                 totalBurning++;
             }
-            if (w.terminalBug === null && w.stuckSeconds > 4.5) {
+            if (w.terminalBug === null && !w.junctionArc && w.stuckSeconds > 4.5) {
                 w.rerouteCooldown -= dt;
                 if (w.rerouteCooldown <= 0) {
                     w.rerouteCooldown = 4.0 + this.rng() * 3.0;
@@ -958,6 +1096,11 @@ export class TrafficSimulator {
         let inNoSpeedingZone = false;
         const brakingAccel = 3.8;
 
+        if (w.junctionArc && Number.isFinite(w.junctionArc.maxSpeedMps)) {
+            infraMaxMps = Math.min(infraMaxMps, w.junctionArc.maxSpeedMps);
+            inNoSpeedingZone = true;
+        }
+
         for (let zi = 0; zi < edge.speedZones.length; zi++) {
             const z = edge.speedZones[zi];
             if (w.distOnEdge > z.endDist) continue;
@@ -1009,8 +1152,10 @@ export class TrafficSimulator {
                 }
 
                 if (Number.isFinite(nodeTargetMps)) {
+                    // Reach target corner speed at turn-arc entry (~6m before node) rather than mid-intersection
+                    const distToTurnEntry = Math.max(0, distToNode - 6.0);
                     const turnApproachCap = Math.sqrt(
-                        nodeTargetMps * nodeTargetMps + 2 * brakingAccel * distToNode
+                        nodeTargetMps * nodeTargetMps + 2 * brakingAccel * distToTurnEntry
                     );
                     infraMaxMps = Math.min(infraMaxMps, turnApproachCap);
                 }
@@ -1032,6 +1177,15 @@ export class TrafficSimulator {
         return { infraMaxMps, inNoSpeedingZone };
     }
 
+    private syncFacingFromBearing(w: WazerAgent): void {
+        const dirX = Math.cos(w.bearingScreenRad);
+        if (dirX < -0.08) {
+            w.facingLeft = true;
+        } else if (dirX > 0.08) {
+            w.facingLeft = false;
+        }
+    }
+
     private syncPoseAndFacing(w: WazerAgent, edge: DirectedEdge, g: RoadGraph): void {
         sampleEdgePositionInto(
             w,
@@ -1042,12 +1196,7 @@ export class TrafficSimulator {
             w.lateralOffset,
             g.cosLat
         );
-        const dirX = Math.cos(w.bearingScreenRad);
-        if (dirX < -0.08) {
-            w.facingLeft = true;
-        } else if (dirX > 0.08) {
-            w.facingLeft = false;
-        }
+        this.syncFacingFromBearing(w);
     }
 
     private updateChaosState(

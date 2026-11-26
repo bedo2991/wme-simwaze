@@ -159,6 +159,22 @@ export interface TerminalBug {
 
 export type WazerState = "CRUISING" | "QUEUED" | "HONKING" | "ON_FIRE" | "ARRIVED";
 
+export interface JunctionArcState {
+    traveledMeters: number;
+    totalMeters: number;
+    exitDistOnEdge: number;
+    maxSpeedMps: number;
+    p0Lon: number;
+    p0Lat: number;
+    u0x: number;
+    u0y: number;
+    p1Lon: number;
+    p1Lat: number;
+    u1x: number;
+    u1y: number;
+    tangentScaleMeters: number;
+}
+
 export interface WazerAgent {
     id: number;
     moodIndex: number;
@@ -166,6 +182,7 @@ export interface WazerAgent {
     distOnEdge: number;
     laneIndex: number;
     lateralOffset: number;
+    junctionArc: JunctionArcState | null;
     lon: number;
     lat: number;
     bearingScreenRad: number;
