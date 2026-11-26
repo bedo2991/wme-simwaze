@@ -1,4 +1,5 @@
 import type {
+    AsyncWmeSDK,
     PermanentHazard,
     RoadClosure,
     Segment,
@@ -7,6 +8,7 @@ import type {
     TurnClosure,
     Node as WmeNode,
 } from "wme-sdk-typings";
+import { distanceMeters, sampleEdgePosition, WebMercatorProjector } from "../src/geo";
 import { buildRoadGraphFromRawData, RawGraphInput } from "../src/graph";
 import { WME_ROAD_TYPE as ROAD_TYPE } from "../src/roadProfiles";
 import { findRoute, hasEnabledOutgoingTurn } from "../src/router";
@@ -1957,4 +1959,115 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
     console.log("PASS: Test 16 — Turn closure blocks only the closed turn, keeping participating segments drivable");
 }
 
-console.log("ALL SIMWAZE TESTS PASSED");
+// ============================================================================
+// Test 17: Dense edge indexing, one-way centering, route reuse & coalesced projector sync
+// ============================================================================
+(async () => {
+    const raw = baseRaw({
+        segments: [
+            makeSegment(1, [[12.0, 45.0], [12.002, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 1,
+                toNodeId: 2,
+                isTwoWay: false,
+                isAtoB: true,
+                fromNodeLanesCount: 1,
+                length: 155,
+            }),
+            makeSegment(2, [[12.002, 45.0], [12.004, 45.0]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                isTwoWay: true,
+                fromNodeLanesCount: 1,
+                toNodeLanesCount: 1,
+                length: 155,
+            }),
+            makeSegment(3, [[12.004, 45.0], [12.004, 45.002]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 3,
+                toNodeId: 4,
+                length: 220,
+            }),
+        ],
+        nodes: [
+            makeNode(1, 12.0, 45.0, [1]),
+            makeNode(2, 12.002, 45.0, [1, 2]),
+            makeNode(3, 12.004, 45.0, [2, 3]),
+            makeNode(4, 12.004, 45.002, [3]),
+        ],
+        streets: [makeStreet(1, "OneWay Entry"), makeStreet(2, "TwoWay Mid"), makeStreet(3, "North Dest")],
+    });
+
+    const graph = buildRoadGraphFromRawData(raw);
+    for (const e of graph.edgeList) {
+        assertEqual(graph.edgeList[e.index], e, `Dense edgeList index matches ${e.id}`);
+    }
+
+    const turn2to3 = graph.outgoing.get("2:F")!.find((t) => t.toEdgeId === "3:F")!;
+    assertOk(
+        turn2to3.turnDeflectionDeg > 85 && turn2to3.turnDeflectionDeg < 95,
+        `Precomputed 90-deg turn deflection (${turn2to3.turnDeflectionDeg.toFixed(1)} deg)`
+    );
+
+    // Single-lane one-way road tracks segment centerline; two-way road offsets outward
+    const oneWayEdge = graph.edges.get("1:F")!;
+    const twoWayEdge = graph.edges.get("2:F")!;
+    const oneWaySample = sampleEdgePosition(oneWayEdge, 50, 0, false, 0, graph.cosLat);
+    const twoWaySample = sampleEdgePosition(twoWayEdge, 50, 0, false, 0, graph.cosLat);
+    assertOk(
+        distanceMeters(oneWaySample.lon, oneWaySample.lat, oneWaySample.lon, 45.0, graph.cosLat) < 0.05,
+        "Single-lane one-way edge centers on road geometry"
+    );
+    assertOk(
+        distanceMeters(twoWaySample.lon, twoWaySample.lat, twoWaySample.lon, 45.0, graph.cosLat) > 2.0,
+        "Two-way edge shifts outward from centerline"
+    );
+
+    // Cached Wazer coordinates & fast-path setGraph route preservation
+    const sim = new TrafficSimulator({ ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 1 });
+    sim.setGraph(graph);
+    const w = sim.spawnSpecificWazer("1:F", "3:F")!;
+    assertOk(w.lon > 11.9 && w.lat > 44.9, "Spawned Wazer has cached lon/lat");
+    for (let i = 0; i < 160; i++) {
+        sim.step(0.1);
+        if (w.edgeId === "2:F") break;
+    }
+    assertEqual(w.edgeId, "2:F", "Wazer advanced onto middle edge 2:F");
+    const rebuiltSame = buildRoadGraphFromRawData(raw);
+    sim.setGraph(rebuiltSame);
+    assertDeepEqual(
+        w.routeEdgeIds,
+        ["2:F", "3:F"],
+        "setGraph fast-path preserves remaining legal route starting at current edge"
+    );
+
+    // Coalesced WebMercatorProjector sync batches concurrent wme-map-move bursts
+    let extentCalls = 0;
+    const mockSdk = {
+        Map: {
+            getMapExtent: async () => {
+                extentCalls++;
+                await new Promise((r) => setTimeout(r, 15));
+                return [12.0, 45.0, 12.01, 45.01];
+            },
+            getZoomLevel: async () => 17,
+            getMapResolution: async () => 0.6,
+            getMapPixelFromLonLat: async ({ lonLat }: { lonLat: { lon: number; lat: number } }) => ({
+                x: (lonLat.lon - 12.0) * 100000,
+                y: (45.01 - lonLat.lat) * 100000,
+            }),
+        },
+    } as unknown as AsyncWmeSDK;
+
+    const proj = new WebMercatorProjector();
+    await Promise.all(Array.from({ length: 12 }, () => proj.syncWithWmeMap(mockSdk)));
+    assertOk(
+        extentCalls <= 2,
+        `12 concurrent syncWithWmeMap calls coalesced into ${extentCalls} SDK batch(es)`
+    );
+    assertOk(proj.isCalibrated(), "Projector calibrated after coalesced sync");
+
+    console.log("PASS: Test 17 — Dense edge indexing, one-way centering, route reuse & coalesced projector sync");
+    console.log("ALL SIMWAZE TESTS PASSED");
+})();

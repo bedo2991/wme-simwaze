@@ -1,5 +1,6 @@
 export class SimAudioEngine {
     private ctx: AudioContext | null = null;
+    private fireBuffer: AudioBuffer | null = null;
     private lastHornMs = 0;
     private lastFireMs = 0;
     private enabled = false;
@@ -88,15 +89,19 @@ export class SimAudioEngine {
 
         const ctx = this.ctx;
         const durationSec = 0.22;
-        const sampleCount = Math.floor(ctx.sampleRate * durationSec);
-        const buffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
-        const data = buffer.getChannelData(0);
-        for (let i = 0; i < sampleCount; i++) {
-            data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (sampleCount * 0.35));
+        if (!this.fireBuffer || this.fireBuffer.sampleRate !== ctx.sampleRate) {
+            const sampleCount = Math.floor(ctx.sampleRate * durationSec);
+            const buffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
+            const data = buffer.getChannelData(0);
+            const invDecay = 1 / (sampleCount * 0.35);
+            for (let i = 0; i < sampleCount; i++) {
+                data[i] = (Math.random() * 2 - 1) * Math.exp(-i * invDecay);
+            }
+            this.fireBuffer = buffer;
         }
 
         const src = ctx.createBufferSource();
-        src.buffer = buffer;
+        src.buffer = this.fireBuffer;
 
         const filter = ctx.createBiquadFilter();
         filter.type = "bandpass";

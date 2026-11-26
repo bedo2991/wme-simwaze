@@ -111,9 +111,16 @@ interface WallClockFields {
     weekday: number;
 }
 
-function projectEvalToTimeZone(evalDt: EvalDateTime, timeZone: string): WallClockFields {
-    try {
-        const fmt = new Intl.DateTimeFormat("en-US", {
+const DTF_CACHE = new Map<string, Intl.DateTimeFormat>();
+const WALL_CLOCK_CACHE = new Map<string, WallClockFields>();
+
+function getCachedDateTimeFormat(timeZone: string): Intl.DateTimeFormat {
+    let fmt = DTF_CACHE.get(timeZone);
+    if (!fmt) {
+        if (DTF_CACHE.size >= 64) {
+            DTF_CACHE.clear();
+        }
+        fmt = new Intl.DateTimeFormat("en-US", {
             timeZone,
             year: "numeric",
             month: "2-digit",
@@ -123,17 +130,49 @@ function projectEvalToTimeZone(evalDt: EvalDateTime, timeZone: string): WallCloc
             second: "2-digit",
             hourCycle: "h23",
         });
+        DTF_CACHE.set(timeZone, fmt);
+    }
+    return fmt;
+}
+
+function projectEvalToTimeZone(evalDt: EvalDateTime, timeZone: string): WallClockFields {
+    const cacheKey = `${Math.floor(evalDt.epochMs / 1000)}|${timeZone}`;
+    const cached = WALL_CLOCK_CACHE.get(cacheKey);
+    if (cached) return cached;
+
+    try {
+        const fmt = getCachedDateTimeFormat(timeZone);
         const parts = fmt.formatToParts(new Date(evalDt.epochMs));
-        const get = (type: Intl.DateTimeFormatPartTypes): number | null => {
-            const found = parts.find((p) => p.type === type);
-            return found ? Number(found.value) : null;
-        };
-        const year = get("year");
-        const month = get("month");
-        const day = get("day");
-        const hour = get("hour");
-        const minute = get("minute");
-        const second = get("second");
+        let year: number | null = null;
+        let month: number | null = null;
+        let day: number | null = null;
+        let hour: number | null = null;
+        let minute: number | null = null;
+        let second: number | null = null;
+        for (const p of parts) {
+            switch (p.type) {
+                case "year":
+                    year = Number(p.value);
+                    break;
+                case "month":
+                    month = Number(p.value);
+                    break;
+                case "day":
+                    day = Number(p.value);
+                    break;
+                case "hour":
+                    hour = Number(p.value);
+                    break;
+                case "minute":
+                    minute = Number(p.value);
+                    break;
+                case "second":
+                    second = Number(p.value);
+                    break;
+                default:
+                    break;
+            }
+        }
         if (
             year != null &&
             month != null &&
@@ -142,7 +181,7 @@ function projectEvalToTimeZone(evalDt: EvalDateTime, timeZone: string): WallCloc
             minute != null &&
             second != null
         ) {
-            return {
+            const resolved: WallClockFields = {
                 year,
                 month,
                 day,
@@ -151,6 +190,11 @@ function projectEvalToTimeZone(evalDt: EvalDateTime, timeZone: string): WallCloc
                 second,
                 weekday: new Date(Date.UTC(year, month - 1, day)).getUTCDay(),
             };
+            if (WALL_CLOCK_CACHE.size >= 128) {
+                WALL_CLOCK_CACHE.clear();
+            }
+            WALL_CLOCK_CACHE.set(cacheKey, resolved);
+            return resolved;
         }
     } catch {
         // Fallback to evalDt fields if timezone identifier is invalid

@@ -1,8 +1,7 @@
 import { AsyncWmeSDK } from "wme-sdk-typings";
-import { describeBugKind } from "./graph";
 import { ROAD_LEGEND_ITEMS } from "./roadProfiles";
 import { formatLocalDateTimeInputValue } from "./timeEval";
-import { ChaosHotspot, MIN_SIM_ZOOM, SimSettings, SimStats } from "./types";
+import { ChaosHotspot, describeBugKind, MIN_SIM_ZOOM, SimSettings, SimStats } from "./types";
 
 export interface SimUICallbacks {
     onSettingsChange: (next: SimSettings) => void;

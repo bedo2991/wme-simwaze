@@ -2,7 +2,7 @@ import { AsyncWmeSDK } from "wme-sdk-typings";
 import { WAZER_MOOD_URIS } from "./src/assets/moods";
 import { SimAudioEngine } from "./src/audio";
 import { WebMercatorProjector } from "./src/geo";
-import { buildRoadGraphFromSDK } from "./src/graph";
+import { buildRoadGraphFromSDK, invalidateFallbackTurnCache } from "./src/graph";
 import { SimCanvasRenderer } from "./src/renderer";
 import { TrafficSimulator } from "./src/simulator";
 import { DEFAULT_SIM_SETTINGS, MIN_SIM_ZOOM, SimSettings } from "./src/types";
@@ -30,12 +30,30 @@ function loadSettings(): SimSettings {
     }
 }
 
-function saveSettings(settings: SimSettings): void {
+let saveSettingsTimer: number | null = null;
+let pendingSaveSettings: SimSettings | null = null;
+
+function flushSavedSettings(): void {
+    if (saveSettingsTimer !== null) {
+        window.clearTimeout(saveSettingsTimer);
+        saveSettingsTimer = null;
+    }
+    if (!pendingSaveSettings) return;
+    const toWrite = pendingSaveSettings;
+    pendingSaveSettings = null;
     try {
-        localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(settings));
+        localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(toWrite));
     } catch (err) {
         console.debug("SimWaze: Failed to save settings:", err);
     }
+}
+
+function scheduleSaveSettings(settings: SimSettings): void {
+    pendingSaveSettings = { ...settings };
+    if (saveSettingsTimer !== null) {
+        window.clearTimeout(saveSettingsTimer);
+    }
+    saveSettingsTimer = window.setTimeout(flushSavedSettings, 150);
 }
 
 window.SDK_INITIALIZED.then(initScript);
@@ -70,21 +88,27 @@ async function initScript(): Promise<void> {
     let rafId: number | null = null;
     let lastFrameMs = 0;
     let lastTelemetryMs = 0;
+    let lastLiveMinuteSlot = Math.floor(Date.now() / 60_000);
     let graphRebuildTimer: number | null = null;
     let isRebuilding = false;
     let rebuildQueued = false;
 
     const ui = new SimSidebarUI(wmeSDK, settings, {
         onSettingsChange: (next) => {
+            const wasEnabled = settings.enabled;
             const prevEvalTimestamp = settings.evalTimestamp;
             Object.assign(settings, next);
-            saveSettings(settings);
+            scheduleSaveSettings(settings);
             audio.setEnabled(settings.soundEnabled);
             if (settings.soundEnabled) audio.unlock();
             simulator.updateSettings(settings);
             if (!settings.enabled) {
+                if (graphRebuildTimer !== null) {
+                    window.clearTimeout(graphRebuildTimer);
+                    graphRebuildTimer = null;
+                }
                 renderer.clear();
-            } else if (prevEvalTimestamp !== settings.evalTimestamp) {
+            } else if (!wasEnabled || prevEvalTimestamp !== settings.evalTimestamp) {
                 scheduleGraphRebuild(50);
             }
             syncAnimationLoop();
@@ -94,6 +118,7 @@ async function initScript(): Promise<void> {
             ui.updateTelemetry(simulator.getStats(), simulator.getHotspots());
         },
         onRescanMap: () => {
+            invalidateFallbackTurnCache();
             void rebuildGraph();
         },
     });
@@ -119,6 +144,7 @@ async function initScript(): Promise<void> {
                 return;
             }
             ui.setZoomWarning(false);
+            lastLiveMinuteSlot = Math.floor(Date.now() / 60_000);
             const graph = await buildRoadGraphFromSDK(wmeSDK, settings.evalTimestamp);
             simulator.setGraph(graph);
             ui.updateTelemetry(simulator.getStats(), simulator.getHotspots());
@@ -134,6 +160,7 @@ async function initScript(): Promise<void> {
     }
 
     function scheduleGraphRebuild(delayMs = 200): void {
+        if (!settings.enabled) return;
         if (graphRebuildTimer !== null) {
             window.clearTimeout(graphRebuildTimer);
         }
@@ -155,6 +182,14 @@ async function initScript(): Promise<void> {
 
         const zoom = projector.getZoomLevel();
         if (zoom >= MIN_SIM_ZOOM) {
+            // Re-evaluate live time-based restrictions/closures when wall-clock minute advances
+            if (!settings.evalTimestamp) {
+                const curMinuteSlot = Math.floor(Date.now() / 60_000);
+                if (curMinuteSlot !== lastLiveMinuteSlot) {
+                    lastLiveMinuteSlot = curMinuteSlot;
+                    scheduleGraphRebuild(100);
+                }
+            }
             simulator.step(dtSec);
             renderer.render(simulator, settings, nowMs / 1000);
         } else {
@@ -191,7 +226,7 @@ async function initScript(): Promise<void> {
                 description: "Toggle SimWaze Live Traffic & Chaos Simulator",
                 callback: () => {
                     settings.enabled = !settings.enabled;
-                    saveSettings(settings);
+                    scheduleSaveSettings(settings);
                     ui.syncEnabledFromLayer(settings.enabled);
                     void wmeSDK.LayerSwitcher.setLayerCheckboxChecked({
                         name: "SimWaze Live Traffic",
@@ -211,10 +246,15 @@ async function initScript(): Promise<void> {
         console.debug("SimWaze: Shortcut registration skipped:", err);
     }
 
+    const onMapEdited = () => {
+        invalidateFallbackTurnCache();
+        scheduleGraphRebuild(150);
+    };
+
     // WME SDK Events
     wmeSDK.Events.on({
         eventName: "wme-map-initial-data-loaded",
-        eventHandler: () => scheduleGraphRebuild(100),
+        eventHandler: () => scheduleGraphRebuild(120),
     });
     wmeSDK.Events.on({
         eventName: "wme-map-data-loaded",
@@ -222,44 +262,49 @@ async function initScript(): Promise<void> {
     });
     wmeSDK.Events.on({
         eventName: "wme-after-edit",
-        eventHandler: () => scheduleGraphRebuild(150),
+        eventHandler: onMapEdited,
     });
     wmeSDK.Events.on({
         eventName: "wme-after-undo",
-        eventHandler: () => scheduleGraphRebuild(150),
+        eventHandler: onMapEdited,
     });
     wmeSDK.Events.on({
         eventName: "wme-after-redo-clear",
-        eventHandler: () => scheduleGraphRebuild(150),
+        eventHandler: onMapEdited,
     });
     wmeSDK.Events.on({
         eventName: "wme-no-edits",
-        eventHandler: () => scheduleGraphRebuild(150),
+        eventHandler: onMapEdited,
     });
     wmeSDK.Events.on({
         eventName: "wme-user-settings-changed",
         eventHandler: () => scheduleGraphRebuild(150),
     });
 
-    try {
-        await wmeSDK.Events.trackDataModelEvents({ dataModelName: "roadClosures" });
-        wmeSDK.Events.on({
-            eventName: "wme-data-model-objects-added",
-            eventHandler: () => scheduleGraphRebuild(150),
-        });
-        wmeSDK.Events.on({
-            eventName: "wme-data-model-objects-changed",
-            eventHandler: () => scheduleGraphRebuild(150),
-        });
-        wmeSDK.Events.on({
-            eventName: "wme-data-model-objects-removed",
-            eventHandler: () => scheduleGraphRebuild(150),
-        });
-    } catch (err) {
-        console.debug("SimWaze: RoadClosures data model tracking unavailable:", err);
+    for (const modelName of ["roadClosures", "turnClosures"] as const) {
+        try {
+            // @ts-ignore: turnClosures may be supported at runtime depending on WME SDK version
+            await wmeSDK.Events.trackDataModelEvents({ dataModelName: modelName });
+        } catch (err) {
+            console.debug(`SimWaze: ${modelName} data model tracking unavailable:`, err);
+        }
     }
 
+    wmeSDK.Events.on({
+        eventName: "wme-data-model-objects-added",
+        eventHandler: () => scheduleGraphRebuild(180),
+    });
+    wmeSDK.Events.on({
+        eventName: "wme-data-model-objects-changed",
+        eventHandler: () => scheduleGraphRebuild(180),
+    });
+    wmeSDK.Events.on({
+        eventName: "wme-data-model-objects-removed",
+        eventHandler: () => scheduleGraphRebuild(180),
+    });
+
     const syncMapProjection = () => {
+        if (!settings.enabled) return;
         void projector.syncWithWmeMap(wmeSDK).then(() => {
             const zoom = projector.getZoomLevel();
             const underZoom = zoom < MIN_SIM_ZOOM;
@@ -280,14 +325,14 @@ async function initScript(): Promise<void> {
         eventName: "wme-map-move-end",
         eventHandler: () => {
             syncMapProjection();
-            scheduleGraphRebuild(220);
+            scheduleGraphRebuild(280);
         },
     });
     wmeSDK.Events.on({
         eventName: "wme-map-zoom-changed",
         eventHandler: () => {
             syncMapProjection();
-            scheduleGraphRebuild(220);
+            scheduleGraphRebuild(280);
         },
     });
 
@@ -296,7 +341,7 @@ async function initScript(): Promise<void> {
         eventHandler: (ev: { name: string; checked: boolean }) => {
             if (ev.name !== "SimWaze Live Traffic") return;
             settings.enabled = ev.checked;
-            saveSettings(settings);
+            scheduleSaveSettings(settings);
             ui.syncEnabledFromLayer(ev.checked);
             simulator.updateSettings(settings);
             if (settings.enabled) {
@@ -311,6 +356,7 @@ async function initScript(): Promise<void> {
     wmeSDK.Events.on({
         eventName: "wme-map-mouse-move",
         eventHandler: (ev: { x: number; y: number }) => {
+            if (!settings.enabled) return;
             renderer.setMousePosition(ev.x, ev.y);
         },
     });
@@ -322,11 +368,14 @@ async function initScript(): Promise<void> {
     });
 
     document.addEventListener("visibilitychange", syncAnimationLoop);
+    window.addEventListener("pagehide", flushSavedSettings);
 
     // Initial calibration & start
-    await projector.syncWithWmeMap(wmeSDK);
-    if (await wmeSDK.State.isInitialMapDataLoaded()) {
-        await rebuildGraph();
+    if (settings.enabled) {
+        await projector.syncWithWmeMap(wmeSDK);
+        if (await wmeSDK.State.isInitialMapDataLoaded()) {
+            await rebuildGraph();
+        }
     }
     syncAnimationLoop();
 }

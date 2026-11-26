@@ -33,6 +33,36 @@ export type BugKind =
     | "DEAD_END"
     | "CAPACITY_BOTTLENECK";
 
+export function describeBugKind(kind: BugKind): string {
+    switch (kind) {
+        case "DISCONNECTED_NODE":
+            return "Disconnected Node";
+        case "DISALLOWED_TURN":
+            return "Impossible Turn Restriction";
+        case "ROAD_CLOSURE":
+            return "Road Closure";
+        case "DEAD_END":
+            return "Dead End / One-Way Trap";
+        case "CAPACITY_BOTTLENECK":
+            return "Road Capacity Bottleneck";
+    }
+}
+
+export function bugShortLabel(kind: BugKind): string {
+    switch (kind) {
+        case "DISCONNECTED_NODE":
+            return "Disconnected Node";
+        case "DISALLOWED_TURN":
+            return "Turn Blocked";
+        case "ROAD_CLOSURE":
+            return "Road Closure";
+        case "DEAD_END":
+            return "Dead End";
+        case "CAPACITY_BOTTLENECK":
+            return "Bottleneck";
+    }
+}
+
 export interface SpeedZone {
     startDist: number;
     endDist: number;
@@ -41,9 +71,11 @@ export interface SpeedZone {
 }
 
 export interface DirectedEdge {
+    index: number;
     id: string;
     segmentId: number;
     isForward: boolean;
+    isTwoWay: boolean;
     fromNodeId: number | null;
     toNodeId: number | null;
     junctionId: number | null;
@@ -54,6 +86,10 @@ export interface DirectedEdge {
     coords: [number, number][];
     cumLengths: number[];
     lengthMeters: number;
+    startXMeters: number;
+    startYMeters: number;
+    endXMeters: number;
+    endYMeters: number;
     speedKmh: number;
     speedMps: number;
     hasUnrestrictedSpeed: boolean;
@@ -71,11 +107,13 @@ export interface DirectedEdge {
 
 export interface DiagnosticTransition {
     toEdgeId: string;
+    toEdgeIndex: number;
     isLegal: boolean;
     bugKind?: BugKind;
     penaltySeconds: number;
     viaNodeId: number | null;
     gapMeters?: number;
+    turnDeflectionDeg: number;
 }
 
 export interface GraphNode {
@@ -88,6 +126,7 @@ export interface GraphNode {
 
 export interface RoadGraph {
     edges: Map<string, DirectedEdge>;
+    edgeList: DirectedEdge[];
     nodes: Map<number, GraphNode>;
     outgoing: Map<string, DiagnosticTransition[]>;
     spawnEdgeIds: string[];
@@ -99,6 +138,7 @@ export interface RoadGraph {
     deadEndBranchEdgeIds: Set<string>;
     isLeftHandTraffic: boolean;
     isImperial: boolean;
+    cosLat: number;
     bounds: [number, number, number, number] | null;
     viewportBBox: [number, number, number, number] | null;
 }
@@ -122,6 +162,9 @@ export interface WazerAgent {
     distOnEdge: number;
     laneIndex: number;
     lateralOffset: number;
+    lon: number;
+    lat: number;
+    bearingScreenRad: number;
     speedMps: number;
     cruiseTrait: number;
     openRoadSeconds: number;

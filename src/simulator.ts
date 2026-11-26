@@ -1,8 +1,7 @@
 import { SimAudioEngine } from "./audio";
-import { distanceMeters, sampleEdgePosition, samplePolylineAt } from "./geo";
+import { distanceMeters, sampleEdgePositionInto, samplePolylineAt } from "./geo";
 import {
     computeTurnDeflectionDeg,
-    describeBugKind,
     edgeDistanceMeters,
     edgeEndCoord,
     pickWeightedEdgeId,
@@ -11,6 +10,7 @@ import { WME_ROAD_TYPE } from "./roadProfiles";
 import { findRoute } from "./router";
 import {
     ChaosHotspot,
+    describeBugKind,
     DirectedEdge,
     Particle,
     RoadGraph,
@@ -67,14 +67,38 @@ function computePersonalAutobahnMps(cruiseTrait: number): number {
     return (130 + traitNorm * 60) / 3.6; // 130..190 km/h
 }
 
+function lookupTurnDeflectionDeg(
+    graph: RoadGraph,
+    edge: DirectedEdge,
+    nextEdge: DirectedEdge
+): number {
+    const transitions = graph.outgoing.get(edge.id);
+    if (transitions) {
+        for (let i = 0; i < transitions.length; i++) {
+            const t = transitions[i];
+            if (t.toEdgeId === nextEdge.id) {
+                return t.turnDeflectionDeg;
+            }
+        }
+    }
+    return computeTurnDeflectionDeg(edge, nextEdge, graph.cosLat);
+}
+
 export class TrafficSimulator {
     private graph: RoadGraph | null = null;
     private settings: SimSettings;
     private wazers: WazerAgent[] = [];
     private particles: Particle[] = [];
+    private particleOverwriteIdx = 0;
     private hotspots: ChaosHotspot[] = [];
     private edgeOccupancy = new Map<string, number>();
     private nodeCooldowns = new Map<number, number>();
+
+    // Reusable per-step pools to minimize GC pressure
+    private byEdgeMap = new Map<string, WazerAgent[]>();
+    private bucketPool: WazerAgent[][] = [];
+    private laneLeadersScratch: Array<WazerAgent | null> = new Array(8).fill(null);
+    private removedIdSet = new Set<number>();
 
     private nextWazerId = 1;
     private arrivedCount = 0;
@@ -157,17 +181,49 @@ export class TrafficSimulator {
             burningCount,
             arrivedCount: this.arrivedCount,
             hotspotCount: this.hotspots.length,
-            edgeCount: this.graph?.edges.size ?? 0,
+            edgeCount: this.graph?.edgeList.length ?? 0,
         };
     }
 
     public reset(): void {
         this.wazers = [];
         this.particles = [];
+        this.particleOverwriteIdx = 0;
         this.hotspots = [];
         this.edgeOccupancy.clear();
         this.nodeCooldowns.clear();
         this.spawnAccumulator = 0;
+    }
+
+    private isRemainingRouteValid(graph: RoadGraph, w: WazerAgent): boolean {
+        if (w.terminalBug !== null) return false;
+        const ids = w.routeEdgeIds;
+        const startIdx = w.routeIndex;
+        if (startIdx < 0 || startIdx >= ids.length) return false;
+        if (ids[startIdx] !== w.edgeId || ids[ids.length - 1] !== w.destEdgeId) return false;
+
+        let prevEdge = graph.edges.get(ids[startIdx]);
+        if (!prevEdge || prevEdge.isClosed || !prevEdge.isDrivableDirection) return false;
+
+        for (let i = startIdx + 1; i < ids.length; i++) {
+            const nextId = ids[i];
+            const nextEdge = graph.edges.get(nextId);
+            if (!nextEdge || nextEdge.isClosed || !nextEdge.isDrivableDirection) return false;
+
+            const transitions = graph.outgoing.get(prevEdge.id);
+            if (!transitions) return false;
+            let foundLegal = false;
+            for (let ti = 0; ti < transitions.length; ti++) {
+                const t = transitions[ti];
+                if (t.isLegal && t.toEdgeId === nextId) {
+                    foundLegal = true;
+                    break;
+                }
+            }
+            if (!foundLegal) return false;
+            prevEdge = nextEdge;
+        }
+        return true;
     }
 
     public setGraph(newGraph: RoadGraph): void {
@@ -184,6 +240,20 @@ export class TrafficSimulator {
 
             w.distOnEdge = Math.min(w.distOnEdge, Math.max(0, edge.lengthMeters - STOP_LINE_METERS));
             w.laneIndex = Math.min(w.laneIndex, edge.lanes - 1);
+
+            // Fast-path: preserve existing legal route on map pans / unrelated edits without A*
+            if (this.isRemainingRouteValid(newGraph, w)) {
+                if (w.routeIndex > 0) {
+                    w.routeEdgeIds = w.routeEdgeIds.slice(w.routeIndex);
+                    w.routeIndex = 0;
+                }
+                const destEdge = newGraph.edges.get(w.destEdgeId);
+                if (destEdge) w.destStreetName = destEdge.streetName;
+                this.syncPoseAndFacing(w, edge, newGraph);
+                surviving.push(w);
+                this.edgeOccupancy.set(w.edgeId, (this.edgeOccupancy.get(w.edgeId) ?? 0) + 1);
+                continue;
+            }
 
             const destEdge = newGraph.edges.get(w.destEdgeId);
             let newRoute =
@@ -242,19 +312,13 @@ export class TrafficSimulator {
             w.routeEdgeIds = newRoute.routeEdgeIds;
             w.routeIndex = 0;
             w.terminalBug = newRoute.terminalBug;
+            this.syncPoseAndFacing(w, edge, newGraph);
 
             if (wasStuckOnBug && newRoute.terminalBug === null) {
-                // The editor fixed the routing bug! Extinguish fire & let traffic flow
                 if (w.state === "ON_FIRE") {
-                    const pos = sampleEdgePosition(
-                        edge,
-                        w.distOnEdge,
-                        w.laneIndex,
-                        newGraph.isLeftHandTraffic
-                    );
                     this.pushParticle({
-                        xLon: pos.lon,
-                        yLat: pos.lat,
+                        xLon: w.lon,
+                        yLat: w.lat,
                         vxPx: (this.rng() - 0.5) * 14,
                         vyPx: -18 - this.rng() * 14,
                         age: 0,
@@ -277,15 +341,18 @@ export class TrafficSimulator {
     }
 
     public spawnSpecificWazer(startEdgeId: string, destEdgeId: string): WazerAgent | null {
-        if (!this.graph) return null;
-        const startEdge = this.graph.edges.get(startEdgeId);
-        const destEdge = this.graph.edges.get(destEdgeId);
-        if (!startEdge || !destEdge || startEdge.isClosed || !startEdge.isDrivableDirection) return null;
+        const g = this.graph;
+        if (!g) return null;
+        const startEdge = g.edges.get(startEdgeId);
+        const destEdge = g.edges.get(destEdgeId);
+        if (!startEdge || !destEdge || startEdge.isClosed || !startEdge.isDrivableDirection) {
+            return null;
+        }
 
         const occ = this.edgeOccupancy.get(startEdgeId) ?? 0;
         if (occ >= startEdge.maxCapacity) return null;
 
-        const initialDist = computeViewportEntryDist(startEdge, this.graph.viewportBBox);
+        const initialDist = computeViewportEntryDist(startEdge, g.viewportBBox);
         const laneIndex = Math.floor(this.rng() * startEdge.lanes);
         for (const existing of this.wazers) {
             if (
@@ -297,15 +364,9 @@ export class TrafficSimulator {
             }
         }
 
-        const route = findRoute(this.graph, startEdgeId, destEdgeId, this.edgeOccupancy);
+        const route = findRoute(g, startEdgeId, destEdgeId, this.edgeOccupancy);
         if (!route || route.routeEdgeIds.length === 0) return null;
 
-        const startPos = sampleEdgePosition(
-            startEdge,
-            initialDist,
-            laneIndex,
-            this.graph.isLeftHandTraffic
-        );
         const cruiseTrait = 1.04 + this.rng() * 0.14;
         const startSpeedMps = startEdge.hasUnrestrictedSpeed
             ? computePersonalAutobahnMps(cruiseTrait) * 0.85
@@ -318,10 +379,13 @@ export class TrafficSimulator {
             distOnEdge: initialDist,
             laneIndex,
             lateralOffset: 0,
+            lon: 0,
+            lat: 0,
+            bearingScreenRad: 0,
             speedMps: startSpeedMps,
             cruiseTrait,
             openRoadSeconds: 0,
-            facingLeft: Math.cos(startPos.bearingScreenRad) < 0,
+            facingLeft: false,
             routeEdgeIds: route.routeEdgeIds,
             routeIndex: 0,
             destStreetName: destEdge.streetName,
@@ -334,6 +398,17 @@ export class TrafficSimulator {
             hornText: "BEEP!",
             rerouteCooldown: 3 + this.rng() * 3,
         };
+
+        sampleEdgePositionInto(
+            wazer,
+            startEdge,
+            initialDist,
+            laneIndex,
+            g.isLeftHandTraffic,
+            0,
+            g.cosLat
+        );
+        wazer.facingLeft = Math.cos(wazer.bearingScreenRad) < 0;
 
         this.wazers.push(wazer);
         this.edgeOccupancy.set(startEdgeId, occ + 1);
@@ -353,7 +428,7 @@ export class TrafficSimulator {
             const cur = queue[qi];
             for (const t of g.outgoing.get(cur) ?? []) {
                 if (!t.isLegal || visited.has(t.toEdgeId)) continue;
-                const next = g.edges.get(t.toEdgeId);
+                const next = g.edgeList[t.toEdgeIndex];
                 if (!next || next.isClosed || !next.isDrivableDirection) continue;
                 visited.add(next.id);
                 queue.push(next.id);
@@ -399,14 +474,17 @@ export class TrafficSimulator {
                 if (!candidateId || candidateId === startId) continue;
                 const cand = g.edges.get(candidateId);
                 if (!cand || cand.segmentId === startEdge.segmentId) continue;
-                if (dTry < 4 && g.destEdgeIds.length > 6 && edgeDistanceMeters(startEdge, cand) < 80) {
+                if (
+                    dTry < 4 &&
+                    g.destEdgeIds.length > 6 &&
+                    edgeDistanceMeters(startEdge, cand) < 80
+                ) {
                     continue;
                 }
                 const spawned = this.spawnSpecificWazer(startId, candidateId);
                 if (spawned) return spawned;
             }
 
-            // Grade-separated freeways / corridors without ramps in view still route through to exits
             const fallbackDestId = this.findCorridorFallbackDestId(startEdge);
             if (fallbackDestId) {
                 const spawned = this.spawnSpecificWazer(startId, fallbackDestId);
@@ -414,6 +492,15 @@ export class TrafficSimulator {
             }
         }
         return null;
+    }
+
+    private acquireBucket(): WazerAgent[] {
+        const b = this.bucketPool.pop();
+        if (b) {
+            b.length = 0;
+            return b;
+        }
+        return [];
     }
 
     public step(rawDtSeconds: number): void {
@@ -433,7 +520,7 @@ export class TrafficSimulator {
             }
         }
 
-        // Spawn Wazers from highways up to maxWazers
+        // Spawn Wazers up to maxWazers
         if (this.wazers.length < this.settings.maxWazers) {
             const spawnRate = Math.max(2, this.settings.maxWazers * 0.22);
             this.spawnAccumulator += dt * spawnRate;
@@ -451,34 +538,46 @@ export class TrafficSimulator {
             this.spawnAccumulator = 0;
         }
 
-        // Group Wazers by directed edge and sort front-to-back
-        const byEdge = new Map<string, WazerAgent[]>();
-        for (const w of this.wazers) {
+        // Group Wazers by directed edge using pooled buckets and sort front-to-back
+        const byEdge = this.byEdgeMap;
+        byEdge.clear();
+        for (let i = 0; i < this.wazers.length; i++) {
+            const w = this.wazers[i];
             let list = byEdge.get(w.edgeId);
             if (!list) {
-                list = [];
+                list = this.acquireBucket();
                 byEdge.set(w.edgeId, list);
             }
             list.push(w);
         }
         for (const list of byEdge.values()) {
-            list.sort((a, b) => b.distOnEdge - a.distOnEdge);
+            if (list.length > 1) {
+                list.sort((a, b) => b.distOnEdge - a.distOnEdge);
+            }
         }
 
-        const removedIds = new Set<number>();
+        const removedIds = this.removedIdSet;
+        removedIds.clear();
+
+        const laneLeader = this.laneLeadersScratch;
 
         // Advance each edge's Wazers front-to-back
         for (const [edgeId, list] of byEdge) {
             const edge = g.edges.get(edgeId);
             if (!edge) {
-                for (const w of list) removedIds.add(w.id);
+                for (let i = 0; i < list.length; i++) removedIds.add(list[i].id);
                 continue;
             }
 
-            // Track last leader distance per lane on this edge
-            const laneLeader: Array<WazerAgent | null> = new Array(edge.lanes).fill(null);
+            for (let l = 0; l < edge.lanes; l++) {
+                laneLeader[l] = null;
+            }
 
-            for (const w of list) {
+            // Capture original count on this edge so vehicles entering mid-step aren't double-stepped
+            const origLen = list.length;
+
+            for (let wi = 0; wi < origLen; wi++) {
+                const w = list[wi];
                 if (w.laneIndex >= edge.lanes) {
                     w.laneIndex = edge.lanes - 1;
                 }
@@ -492,14 +591,25 @@ export class TrafficSimulator {
                             if (candLane === w.laneIndex) continue;
                             const altLeader = laneLeader[candLane];
                             const altGap = altLeader ? altLeader.distOnEdge - w.distOnEdge : Infinity;
-                            // Also ensure no trailing vehicle in altLane is right on top of us
-                            const altBehindClear = !list.some(
-                                (other) =>
-                                    other.id !== w.id &&
-                                    other.laneIndex === candLane &&
-                                    Math.abs(other.distOnEdge - w.distOnEdge) < MIN_GAP_METERS
-                            );
-                            if (altBehindClear && altGap > currentGap + 18) {
+                            if (altGap <= currentGap + 18) continue;
+
+                            // Because list[0..origLen-1] is sorted descending by distOnEdge, only scan nearby neighbors
+                            let altBehindClear = !altLeader || altGap >= MIN_GAP_METERS;
+                            if (altBehindClear) {
+                                for (let bi = wi + 1; bi < list.length; bi++) {
+                                    const other = list[bi];
+                                    const diff = w.distOnEdge - other.distOnEdge;
+                                    if (bi < origLen && diff >= MIN_GAP_METERS) break;
+                                    if (
+                                        other.laneIndex === candLane &&
+                                        Math.abs(diff) < MIN_GAP_METERS
+                                    ) {
+                                        altBehindClear = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (altBehindClear) {
                                 w.lateralOffset += (w.laneIndex - candLane) * 3.2;
                                 w.laneIndex = candLane;
                                 break;
@@ -508,7 +618,6 @@ export class TrafficSimulator {
                     }
                 }
 
-                // Smoothly decay lateral lane-change animation offset
                 if (Math.abs(w.lateralOffset) > 0.02) {
                     w.lateralOffset *= Math.exp(-dt * 8);
                 } else {
@@ -544,8 +653,7 @@ export class TrafficSimulator {
                         ? g.edges.get(w.routeEdgeIds[w.routeIndex + 1])
                         : undefined;
 
-                // Evaluate realistic speed limits: curves, permanent hazards, speed cameras, and upcoming turns
-                const speedProfile = this.evaluateRoadSpeedProfile(w, edge, nextEdge);
+                const speedProfile = this.evaluateRoadSpeedProfile(g, w, edge, nextEdge);
                 const leaderLimitingSpeed =
                     leader != null && leaderCapMps < edge.speedMps * 0.88;
 
@@ -583,7 +691,6 @@ export class TrafficSimulator {
 
                 if (isLastRouteEdge) {
                     if (w.terminalBug !== null) {
-                        // Stuck at routing bug — cannot cross the end of this edge
                         const distToStop = stopLine - w.distOnEdge;
                         if (distToStop <= 0.6) {
                             desiredSpeed = 0;
@@ -592,35 +699,27 @@ export class TrafficSimulator {
                         }
                         maxPos = Math.min(maxPos, stopLine);
                     } else {
-                        // Approaching destination street or map border exit!
                         const targetEnd = Math.max(0.5, edge.lengthMeters - ARRIVAL_RADIUS_METERS);
                         let exitedViewport = false;
                         if (edge.isMapBorderExit && g.viewportBBox && w.distOnEdge > 80) {
-                            const curPt = samplePolylineAt(edge.coords, edge.cumLengths, w.distOnEdge);
-                            const prevPt = samplePolylineAt(
-                                edge.coords,
-                                edge.cumLengths,
-                                Math.max(0, w.distOnEdge - 45)
-                            );
-                            if (
-                                !isPointNearViewport(curPt.lon, curPt.lat, g.viewportBBox, 0.0005) &&
-                                isPointNearViewport(prevPt.lon, prevPt.lat, g.viewportBBox, 0.0005)
-                            ) {
-                                exitedViewport = true;
+                            if (!isPointNearViewport(w.lon, w.lat, g.viewportBBox, 0.0005)) {
+                                const prevPt = samplePolylineAt(
+                                    edge.coords,
+                                    edge.cumLengths,
+                                    Math.max(0, w.distOnEdge - 45)
+                                );
+                                if (isPointNearViewport(prevPt.lon, prevPt.lat, g.viewportBBox, 0.0005)) {
+                                    exitedViewport = true;
+                                }
                             }
                         }
                         if (w.distOnEdge >= targetEnd - 1.5 || exitedViewport) {
                             this.arrivedCount++;
                             if (!edge.isMapBorderExit) {
-                                const pos = sampleEdgePosition(
-                                    edge,
-                                    w.distOnEdge,
-                                    w.laneIndex,
-                                    g.isLeftHandTraffic
-                                );
+                                this.syncPoseAndFacing(w, edge, g);
                                 this.pushParticle({
-                                    xLon: pos.lon,
-                                    yLat: pos.lat,
+                                    xLon: w.lon,
+                                    yLat: w.lat,
                                     vxPx: 0,
                                     vyPx: -12,
                                     age: 0,
@@ -654,11 +753,13 @@ export class TrafficSimulator {
                             chosenNextLane = Math.min(w.laneIndex, nextEdge.lanes - 1);
                             const checkLaneClear = (lane: number): boolean => {
                                 if (!nextList) return true;
-                                return !nextList.some(
-                                    (other) =>
-                                        other.laneIndex === lane &&
-                                        other.distOnEdge < MIN_GAP_METERS
-                                );
+                                for (let ni = nextList.length - 1; ni >= 0; ni--) {
+                                    const other = nextList[ni];
+                                    if (other.laneIndex === lane && other.distOnEdge < MIN_GAP_METERS) {
+                                        return false;
+                                    }
+                                }
+                                return true;
                             };
 
                             if (checkLaneClear(chosenNextLane)) {
@@ -684,11 +785,10 @@ export class TrafficSimulator {
                         }
                         maxPos = Math.min(maxPos, stopLine);
                     } else if (w.distOnEdge + Math.max(w.speedMps, 2) * dt >= edge.lengthMeters) {
-                        // Transition to nextEdge
                         const oldOcc = this.edgeOccupancy.get(edge.id) ?? 1;
                         this.edgeOccupancy.set(edge.id, Math.max(0, oldOcc - 1));
 
-                        const turnDeg = computeTurnDeflectionDeg(edge, nextEdge!);
+                        const turnDeg = lookupTurnDeflectionDeg(g, edge, nextEdge!);
                         if (turnDeg >= 45) {
                             w.openRoadSeconds *= 0.35;
                         }
@@ -702,7 +802,7 @@ export class TrafficSimulator {
                         w.distOnEdge = Math.min(overflow, Math.max(0.2, nextEdge!.lengthMeters * 0.25));
                         w.laneIndex = chosenNextLane;
                         w.lateralOffset = 0;
-                        this.updateFacing(w, nextEdge!, g.isLeftHandTraffic);
+                        this.syncPoseAndFacing(w, nextEdge!, g);
 
                         this.edgeOccupancy.set(
                             nextEdge!.id,
@@ -710,7 +810,7 @@ export class TrafficSimulator {
                         );
                         let nextList = byEdge.get(nextEdge!.id);
                         if (!nextList) {
-                            nextList = [];
+                            nextList = this.acquireBucket();
                             byEdge.set(nextEdge!.id, nextList);
                         }
                         nextList.push(w);
@@ -725,7 +825,6 @@ export class TrafficSimulator {
                             }
                         }
 
-                        // Skip updating laneLeader on old edge since Wazer left it
                         this.updateChaosState(w, nextEdge!, dt, clampedRawDt);
                         continue;
                     }
@@ -737,7 +836,6 @@ export class TrafficSimulator {
                     w.openRoadSeconds = Math.max(0, w.openRoadSeconds - dt * 3.5);
                 }
 
-                // Integrate speed and distance with realistic acceleration and braking
                 if (desiredSpeed > w.speedMps) {
                     w.speedMps = Math.min(desiredSpeed, w.speedMps + 4.8 * dt);
                 } else {
@@ -751,16 +849,28 @@ export class TrafficSimulator {
                     w.speedMps = 0;
                 }
                 w.distOnEdge = Math.max(0, nextDist);
-                this.updateFacing(w, edge, g.isLeftHandTraffic);
+                this.syncPoseAndFacing(w, edge, g);
 
                 laneLeader[w.laneIndex] = w;
                 this.updateChaosState(w, edge, dt, clampedRawDt);
             }
         }
 
-        // Periodic dynamic rerouting for non-bugged queued Wazers to detour around congestion
-        for (const w of this.wazers) {
+        // Return buckets to pool
+        for (const list of byEdge.values()) {
+            list.length = 0;
+            this.bucketPool.push(list);
+        }
+        byEdge.clear();
+
+        // Periodic dynamic rerouting + count burning Wazers in a single pass
+        let totalBurning = 0;
+        for (let i = 0; i < this.wazers.length; i++) {
+            const w = this.wazers[i];
             if (removedIds.has(w.id)) continue;
+            if (w.state === "ON_FIRE") {
+                totalBurning++;
+            }
             if (w.terminalBug === null && w.stuckSeconds > 4.5) {
                 w.rerouteCooldown -= dt;
                 if (w.rerouteCooldown <= 0) {
@@ -774,42 +884,60 @@ export class TrafficSimulator {
             }
         }
 
-        // Remove arrived Wazers and cap excess burnt-out wrecks per jam (>18) so map stays active
-        const burningPerEdge = new Map<string, WazerAgent[]>();
-        for (const w of this.wazers) {
-            if (removedIds.has(w.id)) continue;
-            if (w.state === "ON_FIRE") {
+        // Only group and prune excess burning wrecks when total burning count exceeds jam cap
+        if (totalBurning > MAX_BURNING_PER_JAM) {
+            const burningPerEdge = this.byEdgeMap;
+            for (let i = 0; i < this.wazers.length; i++) {
+                const w = this.wazers[i];
+                if (removedIds.has(w.id) || w.state !== "ON_FIRE") continue;
                 let arr = burningPerEdge.get(w.edgeId);
                 if (!arr) {
-                    arr = [];
+                    arr = this.acquireBucket();
                     burningPerEdge.set(w.edgeId, arr);
                 }
                 arr.push(w);
             }
-        }
-        for (const arr of burningPerEdge.values()) {
-            if (arr.length > MAX_BURNING_PER_JAM) {
-                arr.sort((a, b) => b.stuckSeconds - a.stuckSeconds);
-                for (let i = MAX_BURNING_PER_JAM; i < arr.length; i++) {
-                    if (arr[i].stuckSeconds > this.settings.patienceSeconds + 35) {
-                        removedIds.add(arr[i].id);
+            for (const arr of burningPerEdge.values()) {
+                if (arr.length > MAX_BURNING_PER_JAM) {
+                    arr.sort((a, b) => b.stuckSeconds - a.stuckSeconds);
+                    for (let i = MAX_BURNING_PER_JAM; i < arr.length; i++) {
+                        if (arr[i].stuckSeconds > this.settings.patienceSeconds + 35) {
+                            removedIds.add(arr[i].id);
+                        }
                     }
                 }
+                arr.length = 0;
+                this.bucketPool.push(arr);
             }
+            burningPerEdge.clear();
         }
 
         if (removedIds.size > 0) {
-            this.wazers = this.wazers.filter((w) => !removedIds.has(w.id));
+            let writeIdx = 0;
+            for (let i = 0; i < this.wazers.length; i++) {
+                const w = this.wazers[i];
+                if (!removedIds.has(w.id)) {
+                    this.wazers[writeIdx++] = w;
+                }
+            }
+            this.wazers.length = writeIdx;
             this.rebuildOccupancy();
         }
 
-        // Update particles
+        // Update particles using O(1) swap-and-pop removal
         for (let i = this.particles.length - 1; i >= 0; i--) {
             const p = this.particles[i];
             p.age += clampedRawDt;
             if (p.age >= p.maxAge) {
-                this.particles.splice(i, 1);
+                const lastIdx = this.particles.length - 1;
+                if (i < lastIdx) {
+                    this.particles[i] = this.particles[lastIdx];
+                }
+                this.particles.pop();
             }
+        }
+        if (this.particleOverwriteIdx >= this.particles.length) {
+            this.particleOverwriteIdx = 0;
         }
 
         // Recompute hotspots periodically
@@ -821,6 +949,7 @@ export class TrafficSimulator {
     }
 
     private evaluateRoadSpeedProfile(
+        g: RoadGraph,
         w: WazerAgent,
         edge: DirectedEdge,
         nextEdge: DirectedEdge | undefined
@@ -829,7 +958,8 @@ export class TrafficSimulator {
         let inNoSpeedingZone = false;
         const brakingAccel = 3.8;
 
-        for (const z of edge.speedZones) {
+        for (let zi = 0; zi < edge.speedZones.length; zi++) {
+            const z = edge.speedZones[zi];
             if (w.distOnEdge > z.endDist) continue;
             if (w.distOnEdge >= z.startDist) {
                 infraMaxMps = Math.min(infraMaxMps, z.maxSpeedMps);
@@ -851,7 +981,7 @@ export class TrafficSimulator {
         if (nextEdge) {
             const distToNode = Math.max(0, edge.lengthMeters - w.distOnEdge);
             if (distToNode <= 85) {
-                const turnDeg = computeTurnDeflectionDeg(edge, nextEdge);
+                const turnDeg = lookupTurnDeflectionDeg(g, edge, nextEdge);
                 const isEnteringRoundabout = edge.junctionId == null && nextEdge.junctionId != null;
                 const isFreewayContinuation =
                     edge.roadType === WME_ROAD_TYPE.FREEWAY &&
@@ -863,7 +993,10 @@ export class TrafficSimulator {
                     nodeTargetMps = Math.min(nodeTargetMps, 7.5);
                 } else if (isFreewayContinuation && turnDeg < 35) {
                     if (turnDeg >= 20) {
-                        nodeTargetMps = Math.min(nodeTargetMps, Math.max(32, nextEdge.speedMps * 0.88));
+                        nodeTargetMps = Math.min(
+                            nodeTargetMps,
+                            Math.max(32, nextEdge.speedMps * 0.88)
+                        );
                     }
                 } else if (turnDeg >= 115) {
                     nodeTargetMps = Math.min(nodeTargetMps, 4.5);
@@ -883,8 +1016,8 @@ export class TrafficSimulator {
                 }
             }
 
-            // Look ahead into hazards/curves right at the beginning of nextEdge
-            for (const nz of nextEdge.speedZones) {
+            for (let zi = 0; zi < nextEdge.speedZones.length; zi++) {
+                const nz = nextEdge.speedZones[zi];
                 if (nz.startDist > 35) continue;
                 const distAhead = distToNode + nz.startDist;
                 if (distAhead <= 85) {
@@ -899,19 +1032,17 @@ export class TrafficSimulator {
         return { infraMaxMps, inNoSpeedingZone };
     }
 
-    private updateFacing(
-        w: WazerAgent,
-        edge: DirectedEdge,
-        isLeftHandTraffic: boolean
-    ): void {
-        const pos = sampleEdgePosition(
+    private syncPoseAndFacing(w: WazerAgent, edge: DirectedEdge, g: RoadGraph): void {
+        sampleEdgePositionInto(
+            w,
             edge,
             w.distOnEdge,
             w.laneIndex,
-            isLeftHandTraffic,
-            w.lateralOffset
+            g.isLeftHandTraffic,
+            w.lateralOffset,
+            g.cosLat
         );
-        const dirX = Math.cos(pos.bearingScreenRad);
+        const dirX = Math.cos(w.bearingScreenRad);
         if (dirX < -0.08) {
             w.facingLeft = true;
         } else if (dirX > 0.08) {
@@ -947,17 +1078,10 @@ export class TrafficSimulator {
                 w.state = "ON_FIRE";
                 this.audio?.playFireIgnite();
             }
-            if (this.rng() < rawDt * 8.5 && this.graph) {
-                const pos = sampleEdgePosition(
-                    edge,
-                    w.distOnEdge,
-                    w.laneIndex,
-                    this.graph.isLeftHandTraffic,
-                    w.lateralOffset
-                );
+            if (this.rng() < rawDt * 8.5) {
                 this.pushParticle({
-                    xLon: pos.lon,
-                    yLat: pos.lat,
+                    xLon: w.lon,
+                    yLat: w.lat,
                     vxPx: (this.rng() - 0.5) * 16,
                     vyPx: -18 - this.rng() * 18,
                     age: 0,
@@ -975,25 +1099,16 @@ export class TrafficSimulator {
                 w.hornText = HORN_WORDS[Math.floor(this.rng() * HORN_WORDS.length)];
                 this.audio?.playHorn(w.moodIndex, edge.roadType);
 
-                if (this.graph) {
-                    const pos = sampleEdgePosition(
-                        edge,
-                        w.distOnEdge,
-                        w.laneIndex,
-                        this.graph.isLeftHandTraffic,
-                        w.lateralOffset
-                    );
-                    this.pushParticle({
-                        xLon: pos.lon,
-                        yLat: pos.lat,
-                        vxPx: 0,
-                        vyPx: 0,
-                        age: 0,
-                        maxAge: 0.6,
-                        size: 16,
-                        kind: "RING",
-                    });
-                }
+                this.pushParticle({
+                    xLon: w.lon,
+                    yLat: w.lat,
+                    vxPx: 0,
+                    vyPx: 0,
+                    age: 0,
+                    maxAge: 0.6,
+                    size: 16,
+                    kind: "RING",
+                });
             }
         } else if (w.stuckSeconds >= 1.8) {
             w.state = "QUEUED";
@@ -1004,14 +1119,17 @@ export class TrafficSimulator {
 
     private pushParticle(p: Particle): void {
         if (this.particles.length >= MAX_PARTICLES) {
-            this.particles.shift();
+            this.particles[this.particleOverwriteIdx] = p;
+            this.particleOverwriteIdx = (this.particleOverwriteIdx + 1) % MAX_PARTICLES;
+        } else {
+            this.particles.push(p);
         }
-        this.particles.push(p);
     }
 
     private rebuildOccupancy(): void {
         this.edgeOccupancy.clear();
-        for (const w of this.wazers) {
+        for (let i = 0; i < this.wazers.length; i++) {
+            const w = this.wazers[i];
             this.edgeOccupancy.set(w.edgeId, (this.edgeOccupancy.get(w.edgeId) ?? 0) + 1);
         }
     }
@@ -1026,25 +1144,16 @@ export class TrafficSimulator {
         const stuckItems: Array<{
             w: WazerAgent;
             edge: DirectedEdge;
-            lon: number;
-            lat: number;
         }> = [];
 
-        for (const w of this.wazers) {
+        for (let i = 0; i < this.wazers.length; i++) {
+            const w = this.wazers[i];
             if (w.state === "CRUISING" || w.state === "ARRIVED") continue;
             const edge = g.edges.get(w.edgeId);
             if (!edge) continue;
-            const pos = sampleEdgePosition(
-                edge,
-                w.distOnEdge,
-                w.laneIndex,
-                g.isLeftHandTraffic,
-                w.lateralOffset
-            );
-            stuckItems.push({ w, edge, lon: pos.lon, lat: pos.lat });
+            stuckItems.push({ w, edge });
         }
 
-        // Prioritize root bug-blocked leaders first so clusters anchor on the actual bug point
         stuckItems.sort((a, b) => {
             const aBug = a.w.terminalBug ? 1 : 0;
             const bBug = b.w.terminalBug ? 1 : 0;
@@ -1055,14 +1164,16 @@ export class TrafficSimulator {
         const clusters: ChaosHotspot[] = [];
 
         for (const item of stuckItems) {
-            const anchorLon = item.w.terminalBug?.lon ?? item.lon;
-            const anchorLat = item.w.terminalBug?.lat ?? item.lat;
+            const w = item.w;
+            const anchorLon = w.terminalBug?.lon ?? w.lon;
+            const anchorLat = w.terminalBug?.lat ?? w.lat;
 
             let matched: ChaosHotspot | null = null;
             for (const c of clusters) {
                 if (
-                    distanceMeters(anchorLon, anchorLat, c.lon, c.lat) <= HOTSPOT_CLUSTER_RADIUS_M ||
-                    distanceMeters(item.lon, item.lat, c.lon, c.lat) <= HOTSPOT_CLUSTER_RADIUS_M
+                    distanceMeters(anchorLon, anchorLat, c.lon, c.lat, g.cosLat) <=
+                        HOTSPOT_CLUSTER_RADIUS_M ||
+                    distanceMeters(w.lon, w.lat, c.lon, c.lat, g.cosLat) <= HOTSPOT_CLUSTER_RADIUS_M
                 ) {
                     matched = c;
                     break;
@@ -1070,7 +1181,7 @@ export class TrafficSimulator {
             }
 
             if (!matched) {
-                const bug = item.w.terminalBug;
+                const bug = w.terminalBug;
                 const kind = bug ? bug.kind : "CAPACITY_BOTTLENECK";
                 const segmentId = bug ? bug.segmentId : item.edge.segmentId;
                 const nodeId = bug ? bug.nodeId : item.edge.toNodeId;
@@ -1097,8 +1208,8 @@ export class TrafficSimulator {
             }
 
             matched.stuckCount++;
-            if (item.w.state === "HONKING") matched.honkingCount++;
-            if (item.w.state === "ON_FIRE") matched.burningCount++;
+            if (w.state === "HONKING") matched.honkingCount++;
+            if (w.state === "ON_FIRE") matched.burningCount++;
         }
 
         clusters.sort((a, b) => {
