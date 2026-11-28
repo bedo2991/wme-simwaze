@@ -2879,5 +2879,184 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         console.log("PASS: Test 24 — Decreasing Max Wazers immediately removes excess Wazers & syncs state");
     }
 
+    // 25. Roundabout turn closure keeps segments open when Closures layer is off, SDK throws, or IDs are strings
+    {
+        const rbSegments: Segment[] = [
+            makeSegment(1, [[11.999, 45.002], [12.001, 45.002]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 1,
+                toNodeId: 2,
+            }),
+            makeSegment(2, [[12.002, 45.001], [12.003, 44.999]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 3,
+                toNodeId: 5,
+            }),
+            makeSegment(3, [[12.003, 45.003], [12.005, 45.004]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 4,
+                toNodeId: 6,
+            }),
+            makeSegment(10, [[12.001, 45.002], [12.0014, 45.0012], [12.002, 45.001]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 2,
+                toNodeId: 3,
+                junctionId: 901,
+                isTwoWay: false,
+                isAtoB: true,
+                isBtoA: false,
+                hasClosures: true,
+            }),
+            makeSegment(11, [[12.002, 45.001], [12.003, 45.0019], [12.003, 45.003]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 3,
+                toNodeId: 4,
+                junctionId: 901,
+                isTwoWay: false,
+                isAtoB: true,
+                isBtoA: false,
+                hasClosures: true,
+            }),
+            makeSegment(12, [[12.003, 45.003], [12.002, 45.0032], [12.001, 45.002]], {
+                roadType: ROAD_TYPE.PRIMARY_STREET,
+                fromNodeId: 4,
+                toNodeId: 2,
+                junctionId: 901,
+                isTwoWay: false,
+                isAtoB: true,
+                isBtoA: false,
+                hasClosures: false,
+            }),
+            // Standalone closed street away from roundabout
+            makeSegment(99, [[12.006, 45.006], [12.007, 45.006]], {
+                roadType: ROAD_TYPE.STREET,
+                fromNodeId: 7,
+                toNodeId: 8,
+                hasClosures: true,
+            }),
+        ];
+        const rbNodes: WmeNode[] = [
+            makeNode(1, 11.999, 45.002, [1]),
+            makeNode(2, 12.001, 45.002, [1, 10, 12]),
+            makeNode(3, 12.002, 45.001, [10, 11, 2]),
+            makeNode(4, 12.003, 45.003, [11, 12, 3]),
+            makeNode(5, 12.003, 44.999, [2]),
+            makeNode(6, 12.005, 45.004, [3]),
+            makeNode(7, 12.006, 45.006, [99]),
+            makeNode(8, 12.007, 45.006, [99]),
+        ];
+        const rbStreets: Street[] = [
+            makeStreet(1, "West Ave"),
+            makeStreet(2, "South-East Rd"),
+            makeStreet(3, "North-East Rd"),
+            makeStreet(99, "Closed Standalone St"),
+        ];
+
+        // Case 1: Native WME Closures layer unchecked -> RoadClosures/TurnClosures return []
+        const layerOffGraph = buildRoadGraphFromRawData(
+            baseRaw({
+                viewportBBox: [11.999, 44.999, 12.008, 45.007],
+                closuresLayerVisible: false,
+                segments: rbSegments,
+                nodes: rbNodes,
+                streets: rbStreets,
+            })
+        );
+        assertEqual(layerOffGraph.edges.get("10:F")!.isClosed, false, "Layer off: seg 10 stays open");
+        assertEqual(layerOffGraph.edges.get("11:F")!.isClosed, false, "Layer off: seg 11 stays open");
+        assertEqual(layerOffGraph.edges.get("99:F")!.isClosed, true, "Layer off: standalone seg 99 falls back closed");
+
+        const r2to3 = findRoute(layerOffGraph, "2:R", "3:F", new Map());
+        assertOk(r2to3, "Layer off: route 2:R -> 3:F found");
+        assertEqual(r2to3.terminalBug, null, "Layer off: no bug exiting via seg 11");
+        assertEqual(r2to3.routeEdgeIds.join(","), "2:R,11:F,3:F", "Layer off: uses 11:F cleanly");
+
+        const r1to2 = findRoute(layerOffGraph, "1:F", "2:F", new Map());
+        assertOk(r1to2, "Layer off: route 1:F -> 2:F found");
+        assertEqual(r1to2.terminalBug, null, "Layer off: no bug exiting via seg 10");
+        assertEqual(r1to2.routeEdgeIds.join(","), "1:F,10:F,2:F", "Layer off: uses 10:F cleanly");
+
+        const assertTurn10To11Closed = (g: ReturnType<typeof buildRoadGraphFromRawData>, label: string) => {
+            const t10to11 = (g.outgoing.get("10:F") ?? []).find((t) => t.toEdgeId === "11:F");
+            assertOk(t10to11, `${label}: transition 10:F -> 11:F exists`);
+            assertEqual(t10to11.isLegal, false, `${label}: turn 10->11 is illegal`);
+            assertEqual(t10to11.bugKind, "ROAD_CLOSURE", `${label}: turn 10->11 flagged as ROAD_CLOSURE`);
+            assertEqual(t10to11.viaNodeId, 3, `${label}: closed turn is at node 3`);
+            assertEqual(
+                findRoute(g, "1:F", "3:F", new Map()),
+                null,
+                `${label}: 1:F -> 3:F is blocked cleanly while legal exit 2:F stays open`
+            );
+        };
+
+        assertTurn10To11Closed(layerOffGraph, "Layer off");
+
+        // Case 2: Both RoadClosures.getAll() and TurnClosures.getAll() throw null.map at runtime
+        const throwingSdk = {
+            DataModel: {
+                Segments: { getAll: async () => rbSegments },
+                Nodes: { getAll: async () => rbNodes },
+                Turns: { getAll: async () => [], isTurnAllowed: async () => true },
+                RoadClosures: {
+                    getAll: () => {
+                        const nil = null as unknown as number[];
+                        return Promise.resolve(nil.map((x) => x));
+                    },
+                },
+                TurnClosures: {
+                    getAll: () => {
+                        const nil = null as unknown as number[];
+                        return Promise.resolve(nil.map((x) => x));
+                    },
+                },
+                Streets: { getAll: async () => rbStreets },
+                Countries: { getTopCountry: async () => ({ isLeftHandTraffic: false }) },
+                PermanentHazards: { getAll: async () => [] },
+            },
+            Settings: { getUserSettings: async () => ({ isImperial: false }) },
+            Map: { getMapExtent: async () => [11.999, 44.999, 12.008, 45.007] },
+            LayerSwitcher: { getWMELayerVisibility: async () => true },
+        } as unknown as AsyncWmeSDK;
+
+        const sdkThrowGraph = await buildRoadGraphFromSDK(throwingSdk, null);
+        assertEqual(sdkThrowGraph.edges.get("10:F")!.isClosed, false, "Both throws: seg 10 stays open");
+        assertEqual(sdkThrowGraph.edges.get("11:F")!.isClosed, false, "Both throws: seg 11 stays open");
+        assertEqual(sdkThrowGraph.edges.get("99:F")!.isClosed, true, "Both throws: standalone seg 99 closed");
+        const rThrow2to3 = findRoute(sdkThrowGraph, "2:R", "3:F", new Map());
+        assertOk(rThrow2to3, "Both throws: route 2:R -> 3:F succeeds via 11:F");
+        assertEqual(rThrow2to3.terminalBug, null, "Both throws: no bug on 2:R -> 3:F");
+        assertTurn10To11Closed(sdkThrowGraph, "Both throws");
+
+        // Case 3: Runtime string segment IDs on TurnClosure with roadClosuresFailed=true
+        const stringIdGraph = buildRoadGraphFromRawData(
+            baseRaw({
+                viewportBBox: [11.999, 44.999, 12.008, 45.007],
+                roadClosuresFailed: true,
+                segments: rbSegments,
+                nodes: rbNodes,
+                streets: rbStreets,
+                turnClosures: [
+                    {
+                        id: "tc-str-1",
+                        fromSegmentId: "10" as unknown as number,
+                        toSegmentId: "11" as unknown as number,
+                        description: "String ID turn closure",
+                        startDate: null,
+                        endDate: null,
+                        isPermanent: true,
+                        majorTrafficEventId: null,
+                        status: "ACTIVE",
+                        modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+                    },
+                ],
+            })
+        );
+        assertEqual(stringIdGraph.edges.get("10:F")!.isClosed, false, "String IDs: seg 10 stays open");
+        assertEqual(stringIdGraph.edges.get("11:F")!.isClosed, false, "String IDs: seg 11 stays open");
+        assertTurn10To11Closed(stringIdGraph, "String IDs");
+
+        console.log("PASS: Test 25 — Roundabout turn closure keeps segments open across layer off, throws & string IDs");
+    }
+
     console.log("ALL SIMWAZE TESTS PASSED");
 })();

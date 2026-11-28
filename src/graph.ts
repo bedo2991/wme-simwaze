@@ -61,6 +61,9 @@ export interface RawGraphInput {
     permanentHazards?: PermanentHazard[];
     evalTimestamp?: string | null;
     nowMs?: number;
+    closuresLayerVisible?: boolean;
+    roadClosuresFailed?: boolean;
+    turnClosuresFailed?: boolean;
 }
 
 const MPH_TO_KMH = 1.609344;
@@ -95,14 +98,21 @@ function computeUnrestrictedFreewaySpeedKmh(segId: number, isForward: boolean): 
     return 130 + (hash % 61); // 130..190 km/h
 }
 
-async function safeSdkArray<T>(fn: () => Promise<T[]> | T[], label: string): Promise<T[]> {
+async function safeSdkArrayWithStatus<T>(
+    fn: () => Promise<T[]> | T[],
+    label: string
+): Promise<{ items: T[]; failed: boolean }> {
     try {
         const res = await fn();
-        return Array.isArray(res) ? res : [];
+        return { items: Array.isArray(res) ? res : [], failed: false };
     } catch (err) {
         console.debug(`SimWaze: ${label} threw, falling back to []:`, err);
-        return [];
+        return { items: [], failed: true };
     }
+}
+
+async function safeSdkArray<T>(fn: () => Promise<T[]> | T[], label: string): Promise<T[]> {
+    return (await safeSdkArrayWithStatus(fn, label)).items;
 }
 
 async function safeSdkValue<T>(fn: () => Promise<T> | T, fallback: T, label: string): Promise<T> {
@@ -122,25 +132,33 @@ export async function fetchRawGraphData(
         segments,
         nodes,
         turns,
-        roadClosures,
-        turnClosures,
+        roadClosuresRes,
+        turnClosuresRes,
         streets,
         topCountry,
         userSettings,
         mapExtent,
         permanentHazards,
+        closuresLayerVisible,
     ] = await Promise.all([
         wmeSDK.DataModel.Segments.getAll(),
         wmeSDK.DataModel.Nodes.getAll(),
         safeSdkArray(() => wmeSDK.DataModel.Turns.getAll(), "Turns.getAll"),
-        safeSdkArray(() => wmeSDK.DataModel.RoadClosures.getAll(), "RoadClosures.getAll"),
-        safeSdkArray(() => wmeSDK.DataModel.TurnClosures.getAll(), "TurnClosures.getAll"),
+        safeSdkArrayWithStatus(() => wmeSDK.DataModel.RoadClosures.getAll(), "RoadClosures.getAll"),
+        safeSdkArrayWithStatus(() => wmeSDK.DataModel.TurnClosures.getAll(), "TurnClosures.getAll"),
         safeSdkArray(() => wmeSDK.DataModel.Streets.getAll(), "Streets.getAll"),
         safeSdkValue(() => wmeSDK.DataModel.Countries.getTopCountry(), null, "Countries.getTopCountry"),
         safeSdkValue(() => wmeSDK.Settings.getUserSettings(), null, "Settings.getUserSettings"),
         safeSdkValue(() => wmeSDK.Map.getMapExtent(), null, "Map.getMapExtent"),
         safeSdkArray(() => wmeSDK.DataModel.PermanentHazards.getAll(), "PermanentHazards.getAll"),
+        safeSdkValue(
+            () => wmeSDK.LayerSwitcher.getWMELayerVisibility({ layerName: "closures" }),
+            true,
+            "LayerSwitcher.getWMELayerVisibility(closures)"
+        ),
     ]);
+    const roadClosures = roadClosuresRes.items;
+    const turnClosures = turnClosuresRes.items;
 
     const turnLookup = new Set<string>();
     for (const t of turns) {
@@ -254,6 +272,9 @@ export async function fetchRawGraphData(
         viewportBBox,
         permanentHazards,
         evalTimestamp,
+        closuresLayerVisible,
+        roadClosuresFailed: roadClosuresRes.failed,
+        turnClosuresFailed: turnClosuresRes.failed,
     };
 }
 
@@ -284,19 +305,31 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
     const closedEdges = new Set<string>();
     const segmentsWithClosureRecords = new Set<number>();
     for (const rc of raw.roadClosures) {
-        segmentsWithClosureRecords.add(rc.segmentId);
+        const segId = Number(rc.segmentId);
+        if (!Number.isFinite(segId)) continue;
+        segmentsWithClosureRecords.add(segId);
         if (!isClosureActiveAt(rc, evalDt)) continue;
-        closedEdges.add(`${rc.segmentId}:${rc.isForward ? "F" : "R"}`);
+        closedEdges.add(`${segId}:${rc.isForward ? "F" : "R"}`);
     }
 
     // Index active turn closures by "fromSegId->toSegId" for the selected timestamp
     const closedTurns = new Set<string>();
     for (const tc of raw.turnClosures) {
-        segmentsWithClosureRecords.add(tc.fromSegmentId);
-        segmentsWithClosureRecords.add(tc.toSegmentId);
+        const fromId = Number(tc.fromSegmentId);
+        const toId = Number(tc.toSegmentId);
+        if (!Number.isFinite(fromId) || !Number.isFinite(toId)) continue;
+        segmentsWithClosureRecords.add(fromId);
+        segmentsWithClosureRecords.add(toId);
         if (!isClosureActiveAt(tc, evalDt)) continue;
-        closedTurns.add(`${tc.fromSegmentId}->${tc.toSegmentId}`);
+        closedTurns.add(`${fromId}->${toId}`);
     }
+
+    const closuresLayerOff =
+        raw.closuresLayerVisible === false &&
+        raw.roadClosures.length === 0 &&
+        raw.turnClosures.length === 0;
+    const missingRoadClosureRecords = Boolean(raw.roadClosuresFailed) || closuresLayerOff;
+    const missingTurnClosureRecords = Boolean(raw.turnClosuresFailed) || closuresLayerOff;
 
     const directTurnsByKey = new Map<string, Turn>();
     const pathTurns: Turn[] = [];
@@ -360,6 +393,47 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
             connectedSegmentIds: n.connectedSegmentIds,
             lanesCapacity: Math.max(2, totalLanes),
         });
+    }
+
+    // If TurnClosure records are unavailable (e.g., Closures layer unchecked or SDK getAll threw),
+    // infer roundabout turn closures when adjacent segments with hasClosures=true meet at a roundabout
+    // node that also has at least one open arm, so segments themselves are not marked closed.
+    if (!evalDt.isCustom && missingTurnClosureRecords) {
+        for (const nodeId of roundaboutNodeIds) {
+            const node = nodes.get(nodeId);
+            if (!node) continue;
+
+            let hasOpenArm = false;
+            const inSegs: Segment[] = [];
+            const outSegs: Segment[] = [];
+
+            for (const segId of node.connectedSegmentIds) {
+                const seg = segById.get(segId);
+                if (!seg || !DRIVABLE_ROAD_TYPES.has(seg.roadType) || !seg.isDrivable) continue;
+                if (!seg.hasClosures) {
+                    hasOpenArm = true;
+                    continue;
+                }
+                const dirs = getSegmentAllowedDirections(seg);
+                if ((seg.toNodeId === nodeId && dirs.fwdAllowed) || (seg.fromNodeId === nodeId && dirs.revAllowed)) {
+                    inSegs.push(seg);
+                }
+                if ((seg.fromNodeId === nodeId && dirs.fwdAllowed) || (seg.toNodeId === nodeId && dirs.revAllowed)) {
+                    outSegs.push(seg);
+                }
+            }
+
+            if (!hasOpenArm || inSegs.length === 0 || outSegs.length === 0) continue;
+
+            for (const inSeg of inSegs) {
+                for (const outSeg of outSegs) {
+                    if (inSeg.id === outSeg.id) continue;
+                    segmentsWithClosureRecords.add(inSeg.id);
+                    segmentsWithClosureRecords.add(outSeg.id);
+                    closedTurns.add(`${inSeg.id}->${outSeg.id}`);
+                }
+            }
+        }
     }
 
     const lonSpan = bounds ? Math.max(1e-5, bounds[2] - bounds[0]) : 1;
@@ -538,7 +612,10 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
 
             const hasExplicitClosure =
                 closedEdges.has(id) ||
-                (!evalDt.isCustom && seg.hasClosures && !segmentsWithClosureRecords.has(seg.id));
+                (!evalDt.isCustom &&
+                    missingRoadClosureRecords &&
+                    seg.hasClosures &&
+                    !segmentsWithClosureRecords.has(seg.id));
             const restrictionEffect = evaluateSegmentDirectionRestriction(seg, isForward, evalDt);
             const isBlockedRestriction = restrictionEffect === "BLOCKED";
             const restrictionPenaltyFactor = restrictionEffect === "DISCOURAGED" ? 4.0 : 1.0;

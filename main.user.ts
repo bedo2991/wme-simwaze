@@ -337,32 +337,37 @@ async function initScript(): Promise<void> {
         eventHandler: () => scheduleGraphRebuild(150),
     });
 
-    for (const modelName of ["roadClosures", "turnClosures"] as const) {
+    for (const modelName of ["roadClosures", "segments"] as const) {
         try {
-            // @ts-ignore: turnClosures may be supported at runtime depending on WME SDK version
             await wmeSDK.Events.trackDataModelEvents({ dataModelName: modelName });
         } catch (err) {
             console.debug(`SimWaze: ${modelName} data model tracking unavailable:`, err);
         }
     }
 
+    const onDataModelEvent = (ev?: { dataModelName?: string }) => {
+        if (ev?.dataModelName === "roadClosures" && settings.screensaverMode) {
+            screensaver.notifyMapEdit();
+        } else {
+            scheduleGraphRebuild(180);
+        }
+    };
+
     wmeSDK.Events.on({
         eventName: "wme-data-model-objects-added",
-        eventHandler: () => scheduleGraphRebuild(180),
+        eventHandler: onDataModelEvent,
     });
     wmeSDK.Events.on({
         eventName: "wme-data-model-objects-changed",
-        eventHandler: () => {
-            if (settings.screensaverMode) {
-                screensaver.notifyMapEdit();
-            } else {
-                scheduleGraphRebuild(180);
-            }
-        },
+        eventHandler: onDataModelEvent,
     });
     wmeSDK.Events.on({
         eventName: "wme-data-model-objects-removed",
-        eventHandler: () => scheduleGraphRebuild(180),
+        eventHandler: onDataModelEvent,
+    });
+    wmeSDK.Events.on({
+        eventName: "wme-save-finished",
+        eventHandler: () => scheduleGraphRebuild(150),
     });
 
     const syncMapProjection = () => {
@@ -419,6 +424,10 @@ async function initScript(): Promise<void> {
             );
             ui.setScreensaverStatus(settings.screensaverMode, canDisplayWazers());
         },
+    });
+    wmeSDK.Events.on({
+        eventName: "wme-layer-visibility-changed",
+        eventHandler: () => scheduleGraphRebuild(180),
     });
 
     wmeSDK.Events.on({
