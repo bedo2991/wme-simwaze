@@ -26,6 +26,7 @@ import {
     SimSettings,
     SimStats,
     WazerAgent,
+    WazerState,
 } from "./types";
 
 const MIN_GAP_METERS = 8.5;
@@ -93,6 +94,19 @@ function lookupTurnDeflectionDeg(
     return computeTurnDeflectionDeg(edge, nextEdge, graph.cosLat);
 }
 
+function stateKeepRank(state: WazerState): number {
+    switch (state) {
+        case "ON_FIRE":
+            return 3;
+        case "HONKING":
+            return 2;
+        case "QUEUED":
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 export class TrafficSimulator {
     private graph: RoadGraph | null = null;
     private settings: SimSettings;
@@ -152,7 +166,55 @@ export class TrafficSimulator {
         this.settings = { ...next };
         if (wasEnabled && !next.enabled) {
             this.reset();
+            return;
         }
+        if (next.enabled) {
+            this.enforceMaxWazers();
+        }
+    }
+
+    private enforceMaxWazers(): void {
+        const targetMax = Math.max(0, Math.floor(this.settings.maxWazers));
+        if (this.wazers.length <= targetMax) return;
+
+        this.spawnAccumulator = 0;
+        if (targetMax === 0) {
+            this.wazers.length = 0;
+            this.edgeOccupancy.clear();
+            this.hotspots = [];
+            return;
+        }
+
+        const bbox = this.graph?.viewportBBox ?? null;
+        const prioritized = this.wazers.slice().sort((a, b) => {
+            if (bbox) {
+                const aVis = isPointNearViewport(a.lon, a.lat, bbox) ? 1 : 0;
+                const bVis = isPointNearViewport(b.lon, b.lat, bbox) ? 1 : 0;
+                if (bVis !== aVis) return bVis - aVis;
+            }
+            const rankDiff = stateKeepRank(b.state) - stateKeepRank(a.state);
+            if (rankDiff !== 0) return rankDiff;
+            return a.id - b.id;
+        });
+
+        const keepIds = this.removedIdSet;
+        keepIds.clear();
+        for (let i = 0; i < targetMax; i++) {
+            keepIds.add(prioritized[i].id);
+        }
+
+        let writeIdx = 0;
+        for (let i = 0; i < this.wazers.length; i++) {
+            const w = this.wazers[i];
+            if (keepIds.has(w.id)) {
+                this.wazers[writeIdx++] = w;
+            }
+        }
+        this.wazers.length = writeIdx;
+        keepIds.clear();
+
+        this.rebuildOccupancy();
+        this.recomputeHotspots();
     }
 
     public getGraph(): RoadGraph | null {
@@ -567,6 +629,7 @@ export class TrafficSimulator {
             }
         } else {
             this.spawnAccumulator = 0;
+            this.enforceMaxWazers();
         }
 
         // Group Wazers by directed edge using pooled buckets and sort front-to-back

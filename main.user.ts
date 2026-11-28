@@ -143,6 +143,9 @@ async function initScript(): Promise<void> {
             );
             const nowDisplaying = canDisplayWazers();
             ui.setScreensaverStatus(settings.screensaverMode, nowDisplaying);
+            if (nowDisplaying) {
+                ui.updateTelemetry(simulator.getStats(), simulator.getHotspots());
+            }
 
             if (wasDisplaying && nowDisplaying && prevEvalTimestamp !== settings.evalTimestamp) {
                 scheduleGraphRebuild(50);

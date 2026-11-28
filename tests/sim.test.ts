@@ -2775,5 +2775,109 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         console.log("PASS: Test 23 — Seasonal Santa moods spawn only Nov 28 through Jan 6 inclusive");
     }
 
+    // 24. Decreasing Max Wazers immediately removes excess Wazers and syncs occupancy & hotspots
+    {
+        const raw = baseRaw({
+            segments: [
+                makeSegment(1, [[12.0035, 45.0], [12.004, 45.0]], {
+                    roadType: ROAD_TYPE.FREEWAY,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                    fwdSpeedLimit: 110,
+                    isTwoWay: false,
+                    isAtoB: true,
+                }),
+                makeSegment(2, [[12.0035, 45.0003], [12.004, 45.0]], {
+                    roadType: ROAD_TYPE.FREEWAY,
+                    fromNodeId: 3,
+                    toNodeId: 2,
+                    fwdSpeedLimit: 110,
+                    isTwoWay: false,
+                    isAtoB: true,
+                }),
+                makeSegment(3, [[12.004, 45.0], [12.008, 45.0]], {
+                    roadType: ROAD_TYPE.FREEWAY,
+                    fromNodeId: 2,
+                    toNodeId: 4,
+                    fwdSpeedLimit: 110,
+                    isTwoWay: false,
+                    isAtoB: true,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0035, 45.0, [1]),
+                makeNode(2, 12.004, 45.0, [1, 2, 3]),
+                makeNode(3, 12.0035, 45.0003, [2]),
+                makeNode(4, 12.008, 45.0, [3]),
+            ],
+            streets: [
+                makeStreet(1, "Northbound Fwy"),
+                makeStreet(2, "Collector Ramp"),
+                makeStreet(3, "Expressway Main"),
+            ],
+        });
+        const graph = buildRoadGraphFromRawData(raw);
+
+        const lanePicks = [0.1, 0.5, 0.85];
+        let pickIdx = 0;
+        const sim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, paused: true, maxWazers: 10 },
+            {
+                rng: () => {
+                    const v = lanePicks[pickIdx % lanePicks.length];
+                    pickIdx++;
+                    return v;
+                },
+            }
+        );
+        sim.setGraph(graph);
+
+        const w1 = sim.spawnSpecificWazer("1:F", "3:F")!;
+        const w2 = sim.spawnSpecificWazer("1:F", "3:F")!;
+        const w3 = sim.spawnSpecificWazer("1:F", "3:F")!;
+        const w4 = sim.spawnSpecificWazer("2:F", "3:F")!;
+        const w5 = sim.spawnSpecificWazer("2:F", "3:F")!;
+        const w6 = sim.spawnSpecificWazer("2:F", "3:F")!;
+        assertOk(w1 && w2 && w3 && w4 && w5 && w6, "All 6 freeway Wazers spawned cleanly");
+
+        w1.state = "ON_FIRE";
+        w1.stuckSeconds = 15;
+        w2.state = "ON_FIRE";
+        w2.stuckSeconds = 15;
+        sim.recomputeHotspots();
+        assertEqual(sim.getHotspots()[0].burningCount, 2, "Hotspot initially tracks 2 burning Wazers");
+
+        const totalOccupancy = () => {
+            let sum = 0;
+            for (const c of sim.getEdgeOccupancy().values()) sum += c;
+            return sum;
+        };
+
+        // Decrease from 10 -> 4 while paused: immediately drops newest CRUISING Wazers (w5, w6)
+        sim.updateSettings({ ...DEFAULT_SIM_SETTINGS, paused: true, maxWazers: 4 });
+        assertEqual(sim.getWazers().length, 4, "Decreasing maxWazers to 4 trims immediately while paused");
+        assertDeepEqual(
+            sim.getWazers().map((w) => w.id),
+            [w1.id, w2.id, w3.id, w4.id],
+            "Newest cruising Wazers removed first while ON_FIRE and older Wazers remain"
+        );
+        assertEqual(totalOccupancy(), 4, "Edge occupancy matches remaining 4 Wazers");
+
+        // Decrease from 4 -> 1: keeps highest-priority Wazer (w1) and updates hotspot count
+        sim.updateSettings({ ...DEFAULT_SIM_SETTINGS, paused: true, maxWazers: 1 });
+        assertEqual(sim.getWazers().length, 1, "Decreasing maxWazers to 1 trims immediately");
+        assertEqual(sim.getWazers()[0].id, w1.id, "Oldest burning Wazer w1 is preserved last");
+        assertEqual(totalOccupancy(), 1, "Edge occupancy matches remaining 1 Wazer");
+        assertEqual(sim.getHotspots()[0].burningCount, 1, "Hotspot burningCount updates immediately");
+
+        // Decrease to 0: clears remaining Wazers, occupancy, and hotspots
+        sim.updateSettings({ ...DEFAULT_SIM_SETTINGS, paused: true, maxWazers: 0 });
+        assertEqual(sim.getWazers().length, 0, "Decreasing maxWazers to 0 clears all Wazers");
+        assertEqual(sim.getEdgeOccupancy().size, 0, "Edge occupancy cleared at maxWazers=0");
+        assertEqual(sim.getHotspots().length, 0, "Hotspots cleared at maxWazers=0");
+
+        console.log("PASS: Test 24 — Decreasing Max Wazers immediately removes excess Wazers & syncs state");
+    }
+
     console.log("ALL SIMWAZE TESTS PASSED");
 })();
