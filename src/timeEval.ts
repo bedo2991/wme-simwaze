@@ -22,6 +22,12 @@ export interface EvalDateTime {
 
 export type RestrictionEffect = "BLOCKED" | "DISCOURAGED" | "ALLOWED";
 
+/** Returns true when seasonal Santa moods should spawn (Nov 28 through Jan 6 inclusive). */
+export function isSantaMoodSeason(evalDt: Pick<EvalDateTime, "month" | "day">): boolean {
+    const { month, day } = evalDt;
+    return (month === 11 && day >= 28) || month === 12 || (month === 1 && day <= 6);
+}
+
 type RestrictionLike = Segment["restrictions"][number] | Turn["restrictions"][number];
 type ClosureLike = Pick<RoadClosure | TurnClosure, "status" | "startDate" | "endDate">;
 

@@ -1,5 +1,5 @@
 import { AsyncWmeSDK } from "wme-sdk-typings";
-import { WAZER_MOOD_URIS } from "./src/assets/moods";
+import { SANTA_MOOD_COUNT, YEAR_ROUND_MOOD_COUNT } from "./src/assets/moods";
 import { SimAudioEngine } from "./src/audio";
 import { WebMercatorProjector } from "./src/geo";
 import { buildRoadGraphFromSDK, invalidateFallbackTurnCache } from "./src/graph";
@@ -80,7 +80,8 @@ async function initScript(): Promise<void> {
     const projector = new WebMercatorProjector();
     const simulator = new TrafficSimulator(settings, {
         audio,
-        moodCount: WAZER_MOOD_URIS.length,
+        moodCount: YEAR_ROUND_MOOD_COUNT,
+        santaMoodCount: SANTA_MOOD_COUNT,
     });
 
     const viewportEl = await wmeSDK.Map.getMapViewportElement();

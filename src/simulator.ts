@@ -15,6 +15,7 @@ import {
 } from "./graph";
 import { WME_ROAD_TYPE } from "./roadProfiles";
 import { findRoute } from "./router";
+import { isSantaMoodSeason, resolveEvalDateTime } from "./timeEval";
 import {
     BUMP_DURATION_SEC,
     ChaosHotspot,
@@ -115,21 +116,35 @@ export class TrafficSimulator {
     private spawnAccumulator = 0;
     private hotspotTimer = 0;
     private moodCount: number;
+    private santaMoodCount: number;
     private audio: SimAudioEngine | null;
     private rng: () => number;
+    private nowMs: () => number;
 
     constructor(
         settings: SimSettings,
         options?: {
             audio?: SimAudioEngine | null;
             moodCount?: number;
+            santaMoodCount?: number;
             rng?: () => number;
+            nowMs?: () => number;
         }
     ) {
         this.settings = { ...settings };
         this.audio = options?.audio ?? null;
         this.moodCount = Math.max(1, options?.moodCount ?? 16);
+        this.santaMoodCount = Math.max(0, options?.santaMoodCount ?? 0);
         this.rng = options?.rng ?? Math.random;
+        this.nowMs = options?.nowMs ?? Date.now;
+    }
+
+    private getActiveMoodCount(): number {
+        if (this.santaMoodCount <= 0) return this.moodCount;
+        const evalDt = resolveEvalDateTime(this.settings.evalTimestamp, this.nowMs());
+        return isSantaMoodSeason(evalDt)
+            ? this.moodCount + this.santaMoodCount
+            : this.moodCount;
     }
 
     public updateSettings(next: SimSettings): void {
@@ -387,7 +402,7 @@ export class TrafficSimulator {
 
         const wazer: WazerAgent = {
             id: this.nextWazerId++,
-            moodIndex: Math.floor(this.rng() * this.moodCount),
+            moodIndex: Math.floor(this.rng() * this.getActiveMoodCount()),
             edgeId: startEdgeId,
             distOnEdge: initialDist,
             laneIndex,

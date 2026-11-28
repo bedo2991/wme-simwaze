@@ -8,12 +8,19 @@ import type {
     TurnClosure,
     Node as WmeNode,
 } from "wme-sdk-typings";
+import {
+    SANTA_MOOD_COUNT,
+    SANTA_MOOD_URIS,
+    WAZER_MOOD_URIS,
+    YEAR_ROUND_MOOD_COUNT,
+} from "../src/assets/moods";
 import { distanceMeters, sampleEdgePosition, WebMercatorProjector } from "../src/geo";
 import { buildRoadGraphFromRawData, buildRoadGraphFromSDK, RawGraphInput } from "../src/graph";
 import { WME_ROAD_TYPE as ROAD_TYPE } from "../src/roadProfiles";
 import { findRoute, hasEnabledOutgoingTurn } from "../src/router";
 import { ScreensaverController } from "../src/screensaver";
 import { TrafficSimulator } from "../src/simulator";
+import { isSantaMoodSeason, resolveEvalDateTime } from "../src/timeEval";
 import { computeBumpBounce, DEFAULT_SIM_SETTINGS, MIN_SIM_ZOOM } from "../src/types";
 
 function assertOk(cond: unknown, msg: string): asserts cond {
@@ -2613,6 +2620,159 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         assertOk(sawPairBeforeFirstToll, "Observed twin coin burst right before first toll booth");
         assertOk(sawPairBeforeSecondToll, "Observed twin coin burst right before second toll booth");
         console.log("PASS: Test 22 — Twin gold coin fireworks trigger before TOLL_BOOTH hazards");
+    }
+
+    // 23. Seasonal Santa moods (Happy Santa & Not happy Santa) spawn only Nov 28 through Jan 6 inclusive
+    {
+        assertEqual(YEAR_ROUND_MOOD_COUNT, 59, "59 year-round moods embedded");
+        assertEqual(SANTA_MOOD_COUNT, 2, "2 Santa moods embedded (Happy Santa + Not happy Santa)");
+        assertEqual(SANTA_MOOD_URIS.length, 2, "SANTA_MOOD_URIS has 2 icons");
+        assertEqual(WAZER_MOOD_URIS.length, 61, "Total WAZER_MOOD_URIS has 61 icons");
+        assertOk(
+            WAZER_MOOD_URIS.every((uri) => uri.startsWith("data:image/png;base64,")),
+            "All 61 mood sprites are embedded PNG data URIs"
+        );
+
+        const seasonCases: Array<[string, boolean]> = [
+            ["2026-11-27T23:59", false],
+            ["2026-11-28T00:00", true],
+            ["2026-12-25T12:00", true],
+            ["2027-01-01T00:00", true],
+            ["2027-01-06T23:59", true],
+            ["2027-01-07T00:00", false],
+            ["2028-11-28T09:00", true],
+            ["2029-01-06T18:00", true],
+            ["2028-07-15T12:00", false],
+        ];
+        for (const [ts, expected] of seasonCases) {
+            assertEqual(
+                isSantaMoodSeason(resolveEvalDateTime(ts)),
+                expected,
+                `isSantaMoodSeason(${ts})`
+            );
+        }
+
+        const raw = baseRaw({
+            segments: [
+                makeSegment(1, [[12.0, 45.0], [12.001, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                }),
+                makeSegment(2, [[12.001, 45.0], [12.002, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0, 45.0, [1]),
+                makeNode(2, 12.001, 45.0, [1, 2]),
+                makeNode(3, 12.002, 45.0, [2]),
+            ],
+            streets: [makeStreet(1, "North Pole Blvd"), makeStreet(2, "Candy Cane Ln")],
+        });
+        const graph = buildRoadGraphFromRawData(raw);
+
+        // Live mode (evalTimestamp: null) checks wall-clock nowMs()
+        const nov27LiveSim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, evalTimestamp: null },
+            {
+                moodCount: YEAR_ROUND_MOOD_COUNT,
+                santaMoodCount: SANTA_MOOD_COUNT,
+                rng: () => 0.9999,
+                nowMs: () => new Date(2026, 10, 27, 23, 59).getTime(),
+            }
+        );
+        nov27LiveSim.setGraph(graph);
+        assertEqual(
+            nov27LiveSim.spawnSpecificWazer("1:F", "2:F")!.moodIndex,
+            58,
+            "Nov 27 live caps moodIndex at 58 (no Santa moods)"
+        );
+
+        const jan7LiveSim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, evalTimestamp: null },
+            {
+                moodCount: YEAR_ROUND_MOOD_COUNT,
+                santaMoodCount: SANTA_MOOD_COUNT,
+                rng: () => 0.9999,
+                nowMs: () => new Date(2027, 0, 7, 0, 1).getTime(),
+            }
+        );
+        jan7LiveSim.setGraph(graph);
+        assertEqual(
+            jan7LiveSim.spawnSpecificWazer("1:F", "2:F")!.moodIndex,
+            58,
+            "Jan 7 live caps moodIndex at 58 (no Santa moods)"
+        );
+
+        const nov28LiveSim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, evalTimestamp: null },
+            {
+                moodCount: YEAR_ROUND_MOOD_COUNT,
+                santaMoodCount: SANTA_MOOD_COUNT,
+                rng: () => 59.5 / 61,
+                nowMs: () => new Date(2026, 10, 28, 0, 0).getTime(),
+            }
+        );
+        nov28LiveSim.setGraph(graph);
+        assertEqual(
+            nov28LiveSim.spawnSpecificWazer("1:F", "2:F")!.moodIndex,
+            59,
+            "Nov 28 live enables Happy Santa (moodIndex 59)"
+        );
+
+        const jan6LiveSim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, evalTimestamp: null },
+            {
+                moodCount: YEAR_ROUND_MOOD_COUNT,
+                santaMoodCount: SANTA_MOOD_COUNT,
+                rng: () => 60.5 / 61,
+                nowMs: () => new Date(2027, 0, 6, 23, 59).getTime(),
+            }
+        );
+        jan6LiveSim.setGraph(graph);
+        assertEqual(
+            jan6LiveSim.spawnSpecificWazer("1:F", "2:F")!.moodIndex,
+            60,
+            "Jan 6 live enables Not happy Santa (moodIndex 60)"
+        );
+
+        // Custom evalTimestamp overrides wall-clock date as well
+        const customOffSeasonSim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, evalTimestamp: "2027-01-07T00:00" },
+            {
+                moodCount: YEAR_ROUND_MOOD_COUNT,
+                santaMoodCount: SANTA_MOOD_COUNT,
+                rng: () => 0.9999,
+                nowMs: () => new Date(2026, 11, 25, 12, 0).getTime(),
+            }
+        );
+        customOffSeasonSim.setGraph(graph);
+        assertEqual(
+            customOffSeasonSim.spawnSpecificWazer("1:F", "2:F")!.moodIndex,
+            58,
+            "Custom off-season timestamp prevents Santa moods even on Dec 25"
+        );
+
+        const customHolidaySim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, evalTimestamp: "2026-12-24T20:00" },
+            {
+                moodCount: YEAR_ROUND_MOOD_COUNT,
+                santaMoodCount: SANTA_MOOD_COUNT,
+                rng: () => 60.5 / 61,
+                nowMs: () => new Date(2026, 6, 15, 12, 0).getTime(),
+            }
+        );
+        customHolidaySim.setGraph(graph);
+        assertEqual(
+            customHolidaySim.spawnSpecificWazer("1:F", "2:F")!.moodIndex,
+            60,
+            "Custom holiday timestamp spawns Santa moods even in July"
+        );
+
+        console.log("PASS: Test 23 — Seasonal Santa moods spawn only Nov 28 through Jan 6 inclusive");
     }
 
     console.log("ALL SIMWAZE TESTS PASSED");
