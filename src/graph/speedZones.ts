@@ -8,6 +8,7 @@ import { WME_ROAD_TYPE } from "../roadProfiles";
 import { SpeedZone } from "../types";
 
 const MPH_TO_KMH = 1.609344;
+const VERTICAL_BUMP_HAZARD_TYPES = new Set<string>(["SPEED_BUMP", "TOPES", "RAISED_CROSSWALK"]);
 
 export interface CurvatureSample {
     fwdVertexDist: number;
@@ -167,6 +168,7 @@ function projectPointOntoPolylineDist(
 
 function appendHazardZoneIfMatched(
     zones: SpeedZone[],
+    bumpDists: number[],
     h: PermanentHazard,
     seg: Segment,
     isForward: boolean,
@@ -195,6 +197,7 @@ function appendHazardZoneIfMatched(
 
     let spanStart = 0;
     let spanEnd = lengthMeters;
+    let centerDist = lengthMeters * 0.5;
     let matched = matchesSegment;
 
     if (h.geometry.type === "Point") {
@@ -207,6 +210,7 @@ function appendHazardZoneIfMatched(
             const pad = h.type === "CAMERA" ? 30 : h.type === "TRAFFIC_LIGHT" ? 14 : 10;
             spanStart = Math.max(0, proj.alongDist - pad);
             spanEnd = Math.min(lengthMeters, proj.alongDist + pad);
+            centerDist = Math.max(0, Math.min(lengthMeters, proj.alongDist));
         }
     } else if (h.geometry.type === "Polygon") {
         const ring = h.geometry.coordinates[0] ?? [];
@@ -226,11 +230,16 @@ function appendHazardZoneIfMatched(
             if (Number.isFinite(minAlong) && Number.isFinite(maxAlong)) {
                 spanStart = Math.max(0, minAlong - 8);
                 spanEnd = Math.min(lengthMeters, maxAlong + 8);
+                centerDist = Math.max(0, Math.min(lengthMeters, (minAlong + maxAlong) * 0.5));
             }
         }
     }
 
     if (!matched) return;
+
+    if (VERTICAL_BUMP_HAZARD_TYPES.has(h.type)) {
+        bumpDists.push(centerDist);
+    }
 
     let maxSpeedMps = baseSpeedMps * 0.72;
     switch (h.type) {
@@ -294,8 +303,9 @@ export function buildEdgeSpeedZones(
     segBBox: [number, number, number, number],
     hazardIndex: HazardSpatialIndex,
     cosLat: number
-): SpeedZone[] {
+): { speedZones: SpeedZone[]; bumpDists: number[] } {
     const zones: SpeedZone[] = [];
+    const bumpDists: number[] = [];
 
     // 1. Roundabout ring comfort speed cap
     if (seg.junctionId != null) {
@@ -340,6 +350,7 @@ export function buildEdgeSpeedZones(
         for (const h of directHazards) {
             appendHazardZoneIfMatched(
                 zones,
+                bumpDists,
                 h,
                 seg,
                 isForward,
@@ -367,6 +378,7 @@ export function buildEdgeSpeedZones(
         }
         appendHazardZoneIfMatched(
             zones,
+            bumpDists,
             h,
             seg,
             isForward,
@@ -379,5 +391,9 @@ export function buildEdgeSpeedZones(
         );
     }
 
-    return zones;
+    if (bumpDists.length > 1) {
+        bumpDists.sort((a, b) => a - b);
+    }
+
+    return { speedZones: zones, bumpDists };
 }

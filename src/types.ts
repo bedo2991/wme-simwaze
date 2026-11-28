@@ -107,6 +107,7 @@ export interface DirectedEdge {
     isDeadEnd: boolean;
     restrictionPenaltyFactor: number;
     speedZones: SpeedZone[];
+    bumpDists: number[];
 }
 
 export interface DiagnosticTransition {
@@ -175,6 +176,18 @@ export interface JunctionArcState {
     tangentScaleMeters: number;
 }
 
+export const BUMP_DURATION_SEC = 0.45;
+
+export function computeBumpBounce(bumpTimer: number, bumpStrength = 1): number {
+    if (bumpTimer <= 0) return 0;
+    const progress = Math.max(0, Math.min(1, 1 - bumpTimer / BUMP_DURATION_SEC));
+    // Primary upward hop (0..0.68), followed by a small settle bounce (0.68..1.0)
+    if (progress <= 0.68) {
+        return Math.sin((progress / 0.68) * Math.PI) * bumpStrength;
+    }
+    return Math.sin(((progress - 0.68) / 0.32) * Math.PI) * 0.24 * bumpStrength;
+}
+
 export interface WazerAgent {
     id: number;
     moodIndex: number;
@@ -183,6 +196,8 @@ export interface WazerAgent {
     laneIndex: number;
     lateralOffset: number;
     junctionArc: JunctionArcState | null;
+    bumpTimer: number;
+    bumpStrength: number;
     lon: number;
     lat: number;
     bearingScreenRad: number;

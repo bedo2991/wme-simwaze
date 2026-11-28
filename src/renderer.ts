@@ -4,6 +4,7 @@ import { TrafficSimulator } from "./simulator";
 import {
     bugShortLabel,
     ChaosHotspot,
+    computeBumpBounce,
     describeBugKind,
     DirectedEdge,
     HoverInfo,
@@ -491,9 +492,15 @@ export class SimCanvasRenderer {
             !this.reducedMotion && w.state === "CRUISING"
                 ? Math.sin(nowSec * 7 + w.id * 1.7) * 0.9
                 : 0;
+        const bounce =
+            !this.reducedMotion && w.bumpTimer > 0
+                ? computeBumpBounce(w.bumpTimer, w.bumpStrength)
+                : 0;
+        const bumpLiftPx = bounce * Math.max(4.5, size * 0.28);
 
         const cx = x + wobbleX;
-        const cy = y + bobY;
+        const groundCy = y + bobY;
+        const cy = groundCy - bumpLiftPx;
 
         if (zoom <= 12) {
             ctx.fillStyle =
@@ -511,10 +518,19 @@ export class SimCanvasRenderer {
             return;
         }
 
-        // Ground shadow
+        // Ground shadow stays planted on road surface while subtly shrinking during vertical hops
+        const shadowScale = bounce > 0 ? Math.max(0.68, 1 - bounce * 0.22) : 1;
         ctx.fillStyle = "rgba(15, 23, 42, 0.34)";
         ctx.beginPath();
-        ctx.ellipse(cx, cy + size * 0.36, size * 0.36, size * 0.16, 0, 0, Math.PI * 2);
+        ctx.ellipse(
+            cx,
+            groundCy + size * 0.36,
+            size * 0.36 * shadowScale,
+            size * 0.16 * shadowScale,
+            0,
+            0,
+            Math.PI * 2
+        );
         ctx.fill();
 
         // Subtle forward direction dot
@@ -550,8 +566,10 @@ export class SimCanvasRenderer {
         const sprite = sprites.length > 0 ? sprites[w.moodIndex % sprites.length] : undefined;
         if (sprite && sprite.complete && sprite.naturalWidth > 0) {
             const ratio = sprite.naturalHeight / Math.max(1, sprite.naturalWidth);
-            const drawW = size;
-            const drawH = size * ratio;
+            const squashX = bounce > 0 ? 1 - bounce * 0.05 : 1;
+            const stretchY = bounce > 0 ? 1 + bounce * 0.08 : 1;
+            const drawW = size * squashX;
+            const drawH = size * ratio * stretchY;
             if (w.facingLeft) {
                 ctx.setTransform(-this.dpr, 0, 0, this.dpr, cx * this.dpr, cy * this.dpr);
                 ctx.drawImage(sprite, -drawW * 0.5, -drawH * 0.5, drawW, drawH);

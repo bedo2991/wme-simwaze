@@ -14,7 +14,7 @@ import { WME_ROAD_TYPE as ROAD_TYPE } from "../src/roadProfiles";
 import { findRoute, hasEnabledOutgoingTurn } from "../src/router";
 import { ScreensaverController } from "../src/screensaver";
 import { TrafficSimulator } from "../src/simulator";
-import { DEFAULT_SIM_SETTINGS, MIN_SIM_ZOOM } from "../src/types";
+import { computeBumpBounce, DEFAULT_SIM_SETTINGS, MIN_SIM_ZOOM } from "../src/types";
 
 function assertOk(cond: unknown, msg: string): asserts cond {
     if (!cond) {
@@ -2363,6 +2363,128 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
             "Segment referenced by TurnClosure stays open even when RoadClosures.getAll() threw"
         );
         console.log("PASS: Test 20 — Resilient SDK graph build when RoadClosures.getAll() throws");
+    }
+
+    // ========================================================================
+    // Test 21: Vertical bump animation triggers over speed bumps, topes & raised crosswalks
+    // ========================================================================
+    {
+        const makeBumpHazard = (
+            id: number,
+            type: "SPEED_BUMP" | "TOPES" | "RAISED_CROSSWALK",
+            lon: number,
+            direction: "FWD" | "REV" | "BOTH" = "BOTH"
+        ): PermanentHazard => ({
+            id,
+            type,
+            subTypes: [],
+            segmentId: 1,
+            direction,
+            geometry: { type: "Point", coordinates: [lon, 45.0] },
+            lockRank: 0,
+            rank: 1,
+            modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+        });
+
+        const raw = baseRaw({
+            segments: [
+                makeSegment(1, [[12.0, 45.0], [12.0023, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                    fwdSpeedLimit: 40,
+                    revSpeedLimit: 40,
+                }),
+                makeSegment(2, [[12.0023, 45.0], [12.004, 45.0]], {
+                    roadType: ROAD_TYPE.STREET,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    fwdSpeedLimit: 40,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0, 45.0, [1]),
+                makeNode(2, 12.0023, 45.0, [1, 2]),
+                makeNode(3, 12.004, 45.0, [2]),
+            ],
+            permanentHazards: [
+                makeBumpHazard(901, "SPEED_BUMP", 12.0005, "FWD"),
+                makeBumpHazard(902, "TOPES", 12.00115, "BOTH"),
+                makeBumpHazard(903, "RAISED_CROSSWALK", 12.0018, "BOTH"),
+            ],
+            streets: [makeStreet(1, "Bumpy St"), makeStreet(2, "Smooth Exit St")],
+        });
+
+        const graph = buildRoadGraphFromRawData(raw);
+        const fwdEdge = graph.edges.get("1:F")!;
+        const revEdge = graph.edges.get("1:R")!;
+        assertEqual(fwdEdge.bumpDists.length, 3, "Forward edge extracts all 3 bump hazard positions");
+        assertEqual(revEdge.bumpDists.length, 2, "Reverse edge skips FWD-only SPEED_BUMP");
+        assertOk(
+            fwdEdge.bumpDists[0] < fwdEdge.bumpDists[1] &&
+                fwdEdge.bumpDists[1] < fwdEdge.bumpDists[2],
+            "Forward bumpDists are sorted ascending"
+        );
+
+        const sim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 1 },
+            { rng: () => 0.5 }
+        );
+        sim.setGraph(graph);
+        const w = sim.spawnSpecificWazer("1:F", "2:F")!;
+        assertOk(w, "Wazer spawned on Bumpy St");
+        assertEqual(w.bumpTimer, 0, "Initial bumpTimer is 0");
+        assertEqual(computeBumpBounce(w.bumpTimer, w.bumpStrength), 0, "Initial bounce is 0");
+
+        let checkedPreFirst = false;
+        const triggeredBumpZones = new Set<number>();
+        const peakBounceByZone = new Map<number, number>();
+        let sawSettledToZeroAfterHazards = false;
+
+        for (let step = 0; step < 900; step++) {
+            sim.step(0.05);
+            if (sim.getWazers().length === 0) break;
+
+            if (w.edgeId === "1:F") {
+                if (w.distOnEdge < 25) {
+                    checkedPreFirst = true;
+                    assertEqual(w.bumpTimer, 0, "No bump animation before reaching first speed bump");
+                    assertEqual(computeBumpBounce(w.bumpTimer, w.bumpStrength), 0, "Zero bounce before bump");
+                }
+
+                const bounce = computeBumpBounce(w.bumpTimer, w.bumpStrength);
+                if (w.bumpTimer > 0 && bounce > 0.5) {
+                    for (let zi = 0; zi < fwdEdge.bumpDists.length; zi++) {
+                        if (Math.abs(w.distOnEdge - fwdEdge.bumpDists[zi]) <= 12) {
+                            triggeredBumpZones.add(zi);
+                            const prevPeak = peakBounceByZone.get(zi) ?? 0;
+                            if (bounce > prevPeak) peakBounceByZone.set(zi, bounce);
+                        }
+                    }
+                }
+
+                if (w.distOnEdge > fwdEdge.bumpDists[2] + 15 && w.bumpTimer === 0) {
+                    sawSettledToZeroAfterHazards = true;
+                }
+            } else if (w.bumpTimer === 0) {
+                sawSettledToZeroAfterHazards = true;
+            }
+        }
+
+        assertOk(checkedPreFirst, "Verified zero bump state before first speed bump");
+        assertEqual(
+            triggeredBumpZones.size,
+            3,
+            "Distinct vertical bump animations triggered for SPEED_BUMP, TOPES, and RAISED_CROSSWALK"
+        );
+        for (let zi = 0; zi < 3; zi++) {
+            assertOk(
+                (peakBounceByZone.get(zi) ?? 0) > 0.5,
+                `Zone ${zi} reached peak vertical bounce (${(peakBounceByZone.get(zi) ?? 0).toFixed(2)})`
+            );
+        }
+        assertOk(sawSettledToZeroAfterHazards, "bumpTimer decayed back to 0 after clearing hazards");
+        console.log("PASS: Test 21 — Vertical bump animation over SPEED_BUMP, TOPES & RAISED_CROSSWALK");
     }
 
     console.log("ALL SIMWAZE TESTS PASSED");

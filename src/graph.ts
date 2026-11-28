@@ -571,7 +571,7 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
             const destWeight =
                 isClosed || isRoundaboutRing || isShortRoundaboutFlare ? 0 : profile.destWeight;
 
-            const speedZones = buildEdgeSpeedZones(
+            const { speedZones, bumpDists } = buildEdgeSpeedZones(
                 seg,
                 isForward,
                 edgeCoords,
@@ -623,6 +623,7 @@ export function buildRoadGraphFromRawData(raw: RawGraphInput): RoadGraph {
                 isDeadEnd: false,
                 restrictionPenaltyFactor,
                 speedZones,
+                bumpDists,
             };
 
             edgeList.push(edge);

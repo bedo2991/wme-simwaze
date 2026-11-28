@@ -16,6 +16,7 @@ import {
 import { WME_ROAD_TYPE } from "./roadProfiles";
 import { findRoute } from "./router";
 import {
+    BUMP_DURATION_SEC,
     ChaosHotspot,
     describeBugKind,
     DirectedEdge,
@@ -392,6 +393,8 @@ export class TrafficSimulator {
             laneIndex,
             lateralOffset: 0,
             junctionArc: null,
+            bumpTimer: 0,
+            bumpStrength: 1,
             lon: 0,
             lat: 0,
             bearingScreenRad: 0,
@@ -593,6 +596,11 @@ export class TrafficSimulator {
                 const w = list[wi];
                 if (w.laneIndex >= edge.lanes) {
                     w.laneIndex = edge.lanes - 1;
+                }
+                const prevDistOnEdge = w.distOnEdge;
+                if (w.bumpTimer > 0) {
+                    const bumpDt = clampedRawDt * Math.min(2.0, Math.max(0.85, this.settings.simSpeed));
+                    w.bumpTimer = Math.max(0, w.bumpTimer - bumpDt);
                 }
 
                 // Multi-lane opportunistic lane switch if current lane is blocked closely ahead
@@ -851,6 +859,7 @@ export class TrafficSimulator {
                         if (w.distOnEdge >= maxPos - 0.05 && desiredSpeed === 0) {
                             w.speedMps = 0;
                         }
+                        this.checkBumpCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                         sampleJunctionArcInto(w, arc, u, g.cosLat);
                         this.syncFacingFromBearing(w);
                         laneLeader[w.laneIndex] = w;
@@ -866,6 +875,7 @@ export class TrafficSimulator {
                         w.speedMps = 0;
                     }
                     w.distOnEdge = Math.max(0, postArcDist);
+                    this.checkBumpCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                     this.syncPoseAndFacing(w, edge, g);
                     laneLeader[w.laneIndex] = w;
                     this.updateChaosState(w, edge, dt, clampedRawDt);
@@ -879,6 +889,7 @@ export class TrafficSimulator {
                     nextEdge &&
                     w.distOnEdge + stepDist >= arcEntryDist
                 ) {
+                    this.checkBumpCrossings(w, edge, prevDistOnEdge, Math.max(prevDistOnEdge, arcEntryDist));
                     let intoArc: number;
                     if (w.distOnEdge < arcEntryDist) {
                         intoArc = w.distOnEdge + stepDist - arcEntryDist;
@@ -945,6 +956,7 @@ export class TrafficSimulator {
                         w.junctionArc = arc;
                         const u = intoArc / arc.totalMeters;
                         w.distOnEdge = u * arcExitDist;
+                        this.checkBumpCrossings(w, nextEdge, -0.001, w.distOnEdge);
                         sampleJunctionArcInto(w, arc, u, g.cosLat);
                         this.syncFacingFromBearing(w);
                     } else {
@@ -953,6 +965,7 @@ export class TrafficSimulator {
                             nextEdge.lengthMeters - 0.5,
                             arcExitDist + (intoArc - arc.totalMeters)
                         );
+                        this.checkBumpCrossings(w, nextEdge, -0.001, w.distOnEdge);
                         this.syncPoseAndFacing(w, nextEdge, g);
                     }
 
@@ -987,6 +1000,7 @@ export class TrafficSimulator {
                     w.speedMps = 0;
                 }
                 w.distOnEdge = Math.max(0, nextDist);
+                this.checkBumpCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                 this.syncPoseAndFacing(w, edge, g);
 
                 laneLeader[w.laneIndex] = w;
@@ -1175,6 +1189,24 @@ export class TrafficSimulator {
         }
 
         return { infraMaxMps, inNoSpeedingZone };
+    }
+
+    private checkBumpCrossings(
+        w: WazerAgent,
+        edge: DirectedEdge,
+        prevDist: number,
+        nextDist: number
+    ): void {
+        const bumps = edge.bumpDists;
+        if (bumps.length === 0 || nextDist <= prevDist) return;
+        for (let i = 0; i < bumps.length; i++) {
+            const bd = bumps[i];
+            if (prevDist < bd && nextDist >= bd) {
+                w.bumpTimer = BUMP_DURATION_SEC;
+                w.bumpStrength = Math.max(0.8, Math.min(1.25, 0.7 + w.speedMps * 0.07));
+                break;
+            }
+        }
     }
 
     private syncFacingFromBearing(w: WazerAgent): void {
