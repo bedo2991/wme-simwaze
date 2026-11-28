@@ -10,6 +10,8 @@ export interface SimUICallbacks {
 }
 
 const STYLE_ID = "wme-simwaze-styles";
+export const DISCUSS_FORUM_URL =
+    "https://www.waze.com/discuss/t/script-simwaze-because-not-every-wme-script-needs-to-be-strictly-serious/418691";
 
 export class SimSidebarUI {
     private wmeSDK: AsyncWmeSDK;
@@ -656,6 +658,28 @@ export class SimSidebarUI {
                     </div>
                 </details>
             </section>
+
+            <footer class="wme-sim-footer">
+                <p class="wme-sim-footer-text">
+                    Found a bug, feature request, or chaotic idea?
+                </p>
+                <a
+                    href="${DISCUSS_FORUM_URL}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="wme-sim-discuss-link"
+                >
+                    <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    <span>Waze Discuss Forum</span>
+                    <svg aria-hidden="true" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                        <polyline points="15 3 21 3 21 9"></polyline>
+                        <line x1="10" y1="14" x2="21" y2="3"></line>
+                    </svg>
+                </a>
+            </footer>
         `;
     }
 
@@ -1171,6 +1195,44 @@ export class SimSidebarUI {
             .wme-sim-btn-sm {
                 padding: 3px 8px;
                 font-size: 11px;
+            }
+            .wme-sim-footer {
+                background: var(--surface_default, rgba(128, 128, 128, 0.06));
+                border: 1px solid var(--hairline, rgba(128, 128, 128, 0.25));
+                border-radius: 8px;
+                padding: 9px 12px;
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 6px;
+            }
+            .wme-sim-footer-text {
+                margin: 0;
+                font-size: 11px;
+                color: var(--content_p2, #5f6368);
+            }
+            .wme-sim-discuss-link {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                min-block-size: 32px;
+                padding: 4px 10px;
+                box-sizing: border-box;
+                border-radius: 6px;
+                border: 1px solid var(--hairline, rgba(128, 128, 128, 0.38));
+                background: var(--background_default, #ffffff);
+                color: #1a73e8;
+                font-size: 12px;
+                font-weight: 600;
+                text-decoration: none;
+            }
+            .wme-sim-discuss-link:hover {
+                text-decoration: underline;
+                filter: brightness(0.96);
+            }
+            .wme-sim-discuss-link:focus-visible {
+                outline: 2px solid #1a73e8;
+                outline-offset: 2px;
             }
         `;
         document.head.appendChild(style);

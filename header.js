@@ -3,6 +3,8 @@
 // @namespace   wme-sdk-scripts
 // @version     1.2.1
 // @description Turn the Waze Map Editor into a live top-down traffic & chaos simulator! Tiny Wazers spawn on highways, obey speed limits, turn restrictions, and road closures—and pile up, honk, and catch fire on routing bugs.
+// @homepageURL https://www.waze.com/discuss/t/script-simwaze-because-not-every-wme-script-needs-to-be-strictly-serious/418691
+// @supportURL  https://www.waze.com/discuss/t/script-simwaze-because-not-every-wme-script-needs-to-be-strictly-serious/418691
 // @updateURL   https://github.com/bedo2991/wme-simwaze/releases/latest/download/update.user.js
 // @downloadURL https://github.com/bedo2991/wme-simwaze/releases/latest/download/release.user.js
 // @author      bedo2991 @ Waze
