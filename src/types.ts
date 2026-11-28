@@ -108,6 +108,7 @@ export interface DirectedEdge {
     restrictionPenaltyFactor: number;
     speedZones: SpeedZone[];
     bumpDists: number[];
+    tollDists: number[];
 }
 
 export interface DiagnosticTransition {
@@ -231,7 +232,7 @@ export interface ChaosHotspot {
     description: string;
 }
 
-export type ParticleKind = "SMOKE" | "FIRE" | "RING" | "ARRIVE";
+export type ParticleKind = "SMOKE" | "FIRE" | "RING" | "ARRIVE" | "COIN";
 
 export interface Particle {
     xLon: number;

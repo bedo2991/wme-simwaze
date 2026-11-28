@@ -169,6 +169,7 @@ function projectPointOntoPolylineDist(
 function appendHazardZoneIfMatched(
     zones: SpeedZone[],
     bumpDists: number[],
+    tollDists: number[],
     h: PermanentHazard,
     seg: Segment,
     isForward: boolean,
@@ -240,6 +241,9 @@ function appendHazardZoneIfMatched(
     if (VERTICAL_BUMP_HAZARD_TYPES.has(h.type)) {
         bumpDists.push(centerDist);
     }
+    if (h.type === "TOLL_BOOTH") {
+        tollDists.push(centerDist);
+    }
 
     let maxSpeedMps = baseSpeedMps * 0.72;
     switch (h.type) {
@@ -303,9 +307,10 @@ export function buildEdgeSpeedZones(
     segBBox: [number, number, number, number],
     hazardIndex: HazardSpatialIndex,
     cosLat: number
-): { speedZones: SpeedZone[]; bumpDists: number[] } {
+): { speedZones: SpeedZone[]; bumpDists: number[]; tollDists: number[] } {
     const zones: SpeedZone[] = [];
     const bumpDists: number[] = [];
+    const rawTollDists: number[] = [];
 
     // 1. Roundabout ring comfort speed cap
     if (seg.junctionId != null) {
@@ -351,6 +356,7 @@ export function buildEdgeSpeedZones(
             appendHazardZoneIfMatched(
                 zones,
                 bumpDists,
+                rawTollDists,
                 h,
                 seg,
                 isForward,
@@ -379,6 +385,7 @@ export function buildEdgeSpeedZones(
         appendHazardZoneIfMatched(
             zones,
             bumpDists,
+            rawTollDists,
             h,
             seg,
             isForward,
@@ -395,5 +402,15 @@ export function buildEdgeSpeedZones(
         bumpDists.sort((a, b) => a - b);
     }
 
-    return { speedZones: zones, bumpDists };
+    if (rawTollDists.length > 1) {
+        rawTollDists.sort((a, b) => a - b);
+    }
+    const tollDists: number[] = [];
+    for (let i = 0; i < rawTollDists.length; i++) {
+        if (tollDists.length === 0 || rawTollDists[i] - tollDists[tollDists.length - 1] >= 8) {
+            tollDists.push(rawTollDists[i]);
+        }
+    }
+
+    return { speedZones: zones, bumpDists, tollDists };
 }

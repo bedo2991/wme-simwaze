@@ -2487,5 +2487,133 @@ function baseRaw(overrides: Partial<RawGraphInput> = {}): RawGraphInput {
         console.log("PASS: Test 21 — Vertical bump animation over SPEED_BUMP, TOPES & RAISED_CROSSWALK");
     }
 
+    // ========================================================================
+    // Test 22: Twin gold coin fireworks trigger right before TOLL_BOOTH hazards
+    // ========================================================================
+    {
+        const makeTollHazard = (
+            id: number,
+            lon: number,
+            direction: "FWD" | "REV" | "BOTH" = "BOTH"
+        ): PermanentHazard => ({
+            id,
+            type: "TOLL_BOOTH",
+            subTypes: [],
+            segmentId: 1,
+            direction,
+            geometry: { type: "Point", coordinates: [lon, 45.0] },
+            lockRank: 0,
+            rank: 1,
+            modificationData: { createdBy: null, createdOn: null, updatedBy: null, updatedOn: null },
+        });
+
+        const raw = baseRaw({
+            segments: [
+                makeSegment(1, [[12.0, 45.0], [12.002, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 1,
+                    toNodeId: 2,
+                    fwdSpeedLimit: 50,
+                    revSpeedLimit: 50,
+                }),
+                makeSegment(2, [[12.002, 45.0], [12.0035, 45.0]], {
+                    roadType: ROAD_TYPE.PRIMARY_STREET,
+                    fromNodeId: 2,
+                    toNodeId: 3,
+                    fwdSpeedLimit: 50,
+                }),
+            ],
+            nodes: [
+                makeNode(1, 12.0, 45.0, [1]),
+                makeNode(2, 12.002, 45.0, [1, 2]),
+                makeNode(3, 12.0035, 45.0, [2]),
+            ],
+            permanentHazards: [
+                // Clustered ~2m apart around ~78.6m -> deduplicated into 1 FWD plaza
+                makeTollHazard(951, 12.001, "FWD"),
+                makeTollHazard(952, 12.001025, "FWD"),
+                // Separate toll plaza at ~125.8m (BOTH directions)
+                makeTollHazard(953, 12.0016, "BOTH"),
+            ],
+            streets: [makeStreet(1, "Tollway Plaza"), makeStreet(2, "Highway After Toll")],
+        });
+
+        const graph = buildRoadGraphFromRawData(raw);
+        const fwdEdge = graph.edges.get("1:F")!;
+        const revEdge = graph.edges.get("1:R")!;
+        assertEqual(
+            fwdEdge.tollDists.length,
+            2,
+            "Forward edge deduplicates nearby toll points (<8m) into 2 toll plazas"
+        );
+        assertEqual(
+            revEdge.tollDists.length,
+            1,
+            "Reverse edge excludes FWD-only toll booths"
+        );
+
+        const sim = new TrafficSimulator(
+            { ...DEFAULT_SIM_SETTINGS, simSpeed: 1, maxWazers: 1 },
+            { rng: () => 0.5 }
+        );
+        sim.setGraph(graph);
+        const w = sim.spawnSpecificWazer("1:F", "2:F")!;
+        assertOk(w, "Wazer spawned approaching Tollway Plaza");
+
+        let checkedBeforeFirstToll = false;
+        let sawPairBeforeFirstToll = false;
+        let sawPairBeforeSecondToll = false;
+
+        for (let step = 0; step < 800; step++) {
+            sim.step(0.05);
+            if (sim.getWazers().length === 0) break;
+
+            const coins = sim.getParticles().filter((p) => p.kind === "COIN");
+            if (w.edgeId === "1:F" && w.distOnEdge < fwdEdge.tollDists[0] - 6) {
+                checkedBeforeFirstToll = true;
+                assertEqual(coins.length, 0, "Zero coin particles before approaching toll booth");
+            }
+
+            if (
+                !sawPairBeforeFirstToll &&
+                w.edgeId === "1:F" &&
+                w.distOnEdge >= fwdEdge.tollDists[0] - 4.0 &&
+                w.distOnEdge < fwdEdge.tollDists[0]
+            ) {
+                assertEqual(
+                    coins.length,
+                    2,
+                    "Two firework coin particles spawn right before driving through first toll booth"
+                );
+                assertOk(
+                    coins.some((c) => c.vxPx < 0) &&
+                        coins.some((c) => c.vxPx > 0) &&
+                        coins.every((c) => c.vyPx < 0),
+                    "Twin coins launch upward with opposite left/right firework velocities"
+                );
+                sawPairBeforeFirstToll = true;
+            }
+
+            if (
+                !sawPairBeforeSecondToll &&
+                w.edgeId === "1:F" &&
+                w.distOnEdge >= fwdEdge.tollDists[1] - 4.0 &&
+                w.distOnEdge < fwdEdge.tollDists[1]
+            ) {
+                assertEqual(
+                    coins.length,
+                    2,
+                    "Two firework coin particles spawn right before second toll booth"
+                );
+                sawPairBeforeSecondToll = true;
+            }
+        }
+
+        assertOk(checkedBeforeFirstToll, "Verified no coin particles prior to toll approach");
+        assertOk(sawPairBeforeFirstToll, "Observed twin coin burst right before first toll booth");
+        assertOk(sawPairBeforeSecondToll, "Observed twin coin burst right before second toll booth");
+        console.log("PASS: Test 22 — Twin gold coin fireworks trigger before TOLL_BOOTH hazards");
+    }
+
     console.log("ALL SIMWAZE TESTS PASSED");
 })();

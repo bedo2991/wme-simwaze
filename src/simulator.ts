@@ -862,6 +862,7 @@ export class TrafficSimulator {
                         this.checkBumpCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                         sampleJunctionArcInto(w, arc, u, g.cosLat);
                         this.syncFacingFromBearing(w);
+                        this.checkTollBoothCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                         laneLeader[w.laneIndex] = w;
                         this.updateChaosState(w, edge, dt, clampedRawDt);
                         continue;
@@ -877,6 +878,7 @@ export class TrafficSimulator {
                     w.distOnEdge = Math.max(0, postArcDist);
                     this.checkBumpCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                     this.syncPoseAndFacing(w, edge, g);
+                    this.checkTollBoothCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                     laneLeader[w.laneIndex] = w;
                     this.updateChaosState(w, edge, dt, clampedRawDt);
                     continue;
@@ -889,7 +891,9 @@ export class TrafficSimulator {
                     nextEdge &&
                     w.distOnEdge + stepDist >= arcEntryDist
                 ) {
-                    this.checkBumpCrossings(w, edge, prevDistOnEdge, Math.max(prevDistOnEdge, arcEntryDist));
+                    const edgeEndCheckDist = Math.max(prevDistOnEdge, arcEntryDist);
+                    this.checkBumpCrossings(w, edge, prevDistOnEdge, edgeEndCheckDist);
+                    this.checkTollBoothCrossings(w, edge, prevDistOnEdge, edgeEndCheckDist);
                     let intoArc: number;
                     if (w.distOnEdge < arcEntryDist) {
                         intoArc = w.distOnEdge + stepDist - arcEntryDist;
@@ -959,6 +963,7 @@ export class TrafficSimulator {
                         this.checkBumpCrossings(w, nextEdge, -0.001, w.distOnEdge);
                         sampleJunctionArcInto(w, arc, u, g.cosLat);
                         this.syncFacingFromBearing(w);
+                        this.checkTollBoothCrossings(w, nextEdge, -0.001, w.distOnEdge);
                     } else {
                         w.junctionArc = null;
                         w.distOnEdge = Math.min(
@@ -967,6 +972,7 @@ export class TrafficSimulator {
                         );
                         this.checkBumpCrossings(w, nextEdge, -0.001, w.distOnEdge);
                         this.syncPoseAndFacing(w, nextEdge, g);
+                        this.checkTollBoothCrossings(w, nextEdge, -0.001, w.distOnEdge);
                     }
 
                     this.edgeOccupancy.set(
@@ -1002,6 +1008,7 @@ export class TrafficSimulator {
                 w.distOnEdge = Math.max(0, nextDist);
                 this.checkBumpCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
                 this.syncPoseAndFacing(w, edge, g);
+                this.checkTollBoothCrossings(w, edge, prevDistOnEdge, w.distOnEdge);
 
                 laneLeader[w.laneIndex] = w;
                 this.updateChaosState(w, edge, dt, clampedRawDt);
@@ -1204,6 +1211,46 @@ export class TrafficSimulator {
             if (prevDist < bd && nextDist >= bd) {
                 w.bumpTimer = BUMP_DURATION_SEC;
                 w.bumpStrength = Math.max(0.8, Math.min(1.25, 0.7 + w.speedMps * 0.07));
+                break;
+            }
+        }
+    }
+
+    private checkTollBoothCrossings(
+        w: WazerAgent,
+        edge: DirectedEdge,
+        prevDist: number,
+        nextDist: number
+    ): void {
+        const tolls = edge.tollDists;
+        if (tolls.length === 0 || nextDist <= prevDist) return;
+        for (let i = 0; i < tolls.length; i++) {
+            const td = tolls[i];
+            // Trigger ~4m before the toll booth center ("right about to drive through")
+            const triggerDist = td > 4.5 ? td - 4.0 : Math.max(0.1, td * 0.5);
+            if (prevDist < triggerDist && nextDist >= triggerDist) {
+                // Left-arcing yellow coin
+                this.pushParticle({
+                    xLon: w.lon,
+                    yLat: w.lat,
+                    vxPx: -(20 + this.rng() * 10),
+                    vyPx: -(84 + this.rng() * 12),
+                    age: 0,
+                    maxAge: 0.76,
+                    size: 6.2,
+                    kind: "COIN",
+                });
+                // Right-arcing yellow coin
+                this.pushParticle({
+                    xLon: w.lon,
+                    yLat: w.lat,
+                    vxPx: 20 + this.rng() * 10,
+                    vyPx: -(90 + this.rng() * 12),
+                    age: 0,
+                    maxAge: 0.82,
+                    size: 6.2,
+                    kind: "COIN",
+                });
                 break;
             }
         }

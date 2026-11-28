@@ -675,6 +675,60 @@ export class SimCanvasRenderer {
                 ctx.beginPath();
                 ctx.arc(baseX, baseY, 4 + t * 14, 0, Math.PI * 2);
                 ctx.stroke();
+            } else if (p.kind === "COIN") {
+                const coinX = baseX + p.vxPx * p.age * motionMult;
+                const coinY =
+                    baseY - 8 + (p.vyPx * p.age + 0.5 * 210 * p.age * p.age) * motionMult;
+                const coinAlpha = t < 0.7 ? 1 : Math.max(0, (1 - t) / 0.3);
+                const spinPhase = p.age * 11 + (p.vxPx > 0 ? 1.1 : 0);
+                const spinScale = this.reducedMotion
+                    ? 0.85
+                    : Math.max(0.22, Math.abs(Math.cos(spinPhase)));
+                const rx = p.size * spinScale;
+                const ry = p.size;
+
+                ctx.globalAlpha = coinAlpha;
+
+                // Subtle firework burst sparkle near launch/apex
+                if (!this.reducedMotion && t < 0.4) {
+                    const sparkR = 2.2 * (1 - t / 0.4);
+                    ctx.strokeStyle = "#fef08a";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(coinX - rx - sparkR - 1, coinY);
+                    ctx.lineTo(coinX - rx - 1, coinY);
+                    ctx.moveTo(coinX, coinY - ry - sparkR - 1);
+                    ctx.lineTo(coinX, coinY - ry - 1);
+                    ctx.stroke();
+                }
+
+                // Outer yellow-gold coin disc
+                ctx.fillStyle = "#facc15";
+                ctx.strokeStyle = "#b45309";
+                ctx.lineWidth = 1.3;
+                ctx.beginPath();
+                ctx.ellipse(coinX, coinY, rx, ry, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                // Locale-neutral arcade coin inner vertical emblem bar (no $ / € text)
+                if (spinScale > 0.34) {
+                    const slotHalfW = Math.max(0.7, p.size * 0.2 * spinScale);
+                    const slotHalfH = p.size * 0.46;
+                    ctx.fillStyle = "#fef08a";
+                    ctx.strokeStyle = "#ca8a04";
+                    ctx.lineWidth = 0.8;
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        coinX - slotHalfW,
+                        coinY - slotHalfH,
+                        slotHalfW * 2,
+                        slotHalfH * 2,
+                        slotHalfW
+                    );
+                    ctx.fill();
+                    ctx.stroke();
+                }
             } else if (p.kind === "FIRE") {
                 ctx.globalAlpha = alpha * 0.85;
                 ctx.fillStyle = "#f97316";
